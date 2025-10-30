@@ -76,7 +76,11 @@ library ConfigManager {
     // ====================== EXTERNAL FUNCTIONS ======================
 
     /**
-     * @notice Propose a config change
+     * @notice Propose a configuration change with timelock
+     * @dev Validates the value and enforces cooldown period between changes
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @param value Proposed new value
      */
     function proposeChange(
         ConfigStorage storage cs,
@@ -108,9 +112,13 @@ library ConfigManager {
     }
 
     /**
-     * @notice Execute a pending proposal
-     * @return keyHash The key to apply
-     * @return value The new value
+     * @notice Execute a pending proposal after timelock has expired
+     * @dev Applies the configuration change and cleans up proposal data
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @param value Expected value (must match the proposal)
+     * @return keyHash The hashed key to apply in the main contract
+     * @return newValue The new value to apply
      */
     function executeProposal(
         ConfigStorage storage cs,
@@ -135,7 +143,11 @@ library ConfigManager {
     }
 
     /**
-     * @notice Cancel a pending proposal (by admin, even if not proposer)
+     * @notice Cancel a pending proposal before execution
+     * @dev Can be called by admin even if they didn't create the proposal
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @param value Value of the proposal to cancel
      */
     function cancelProposal(
         ConfigStorage storage cs,
@@ -160,7 +172,12 @@ library ConfigManager {
     // ====================== VIEW FUNCTIONS ======================
 
     /**
-     * @notice Get active proposal for a key
+     * @notice Get the active proposal for a configuration key
+     * @dev Returns the proposal and whether it's still active
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @return proposal The proposal details
+     * @return isActive Whether the proposal is still active
      */
     function getActiveProposal(
         ConfigStorage storage cs,
@@ -176,6 +193,13 @@ library ConfigManager {
         }
     }
 
+    /**
+     * @notice Get a specific proposal by key and value
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @param value Configuration parameter value
+     * @return Proposal details
+     */
     function getProposal(
         ConfigStorage storage cs,
         string memory key,
@@ -185,6 +209,12 @@ library ConfigManager {
         return cs.proposals[id];
     }
 
+    /**
+     * @notice Check if a configuration key has an active proposal
+     * @param cs Configuration storage reference
+     * @param key Configuration parameter key
+     * @return Whether an active proposal exists for this key
+     */
     function isProposalActive(
         ConfigStorage storage cs,
         string memory key

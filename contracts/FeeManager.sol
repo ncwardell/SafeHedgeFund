@@ -71,8 +71,16 @@ library FeeManager {
     // ====================== EXTERNAL FUNCTIONS ======================
 
     /**
-     * @notice Updates AUM and accrues management + performance fees
+     * @notice Updates AUM and accrues management and performance fees
      * @dev Fixed CRITICAL #3: Uses normalize/denormalize function pointers from vault
+     * @param fs Fee storage reference
+     * @param newAum New total AUM value
+     * @param totalSupply Total share supply
+     * @param onChainLiquidity Total on-chain liquidity for validation
+     * @param normalize Function to normalize amounts to 18 decimals
+     * @param denormalize Function to denormalize amounts from 18 decimals
+     * @return adjustedAum AUM after deducting accrued fees
+     * @return newNavPerShare Updated NAV per share
      */
     function accrueFeesOnAumUpdate(
         FeeStorage storage fs,
@@ -138,6 +146,10 @@ library FeeManager {
     /**
      * @notice Accrues entrance fee on deposit
      * @dev Returns amounts in native decimals (not normalized)
+     * @param fs Fee storage reference
+     * @param depositAmount Total deposit amount before fees
+     * @return netAmount Net deposit amount after fee deduction
+     * @return feeNative Entrance fee amount in native decimals
      */
     function accrueEntranceFee(
         FeeStorage storage fs,
@@ -159,6 +171,10 @@ library FeeManager {
     /**
      * @notice Accrues exit fee on redemption
      * @dev Works with normalized amounts (18 decimals)
+     * @param fs Fee storage reference
+     * @param grossAmount Gross redemption amount before fees (normalized)
+     * @return netAmount Net redemption amount after fee deduction
+     * @return feeNative Exit fee amount
      */
     function accrueExitFee(
         FeeStorage storage fs,
@@ -175,8 +191,15 @@ library FeeManager {
     }
 
     /**
-     * @notice Pays out accrued fees
+     * @notice Pays out all accrued fees to the fee recipient
      * @dev Fixed CRITICAL #3: Uses denormalize function pointer from vault
+     * @dev Requires target liquidity threshold to be met before payout
+     * @param fs Fee storage reference
+     * @param baseToken Base token contract
+     * @param feeRecipient Address to receive fees
+     * @param safeWallet Safe wallet address for additional liquidity
+     * @param isModuleEnabled Function to check if vault is enabled as Safe module
+     * @param denormalize Function to denormalize amounts from 18 decimals
      */
     function payoutFees(
         FeeStorage storage fs,
@@ -246,6 +269,11 @@ library FeeManager {
 
     // ====================== VIEW HELPERS ======================
 
+    /**
+     * @notice Get total accrued fees across all fee types
+     * @param fs Fee storage reference
+     * @return Total accrued fees in 18 decimals
+     */
     function totalAccruedFees(FeeStorage storage fs) external view returns (uint256) {
         return fs.accruedManagementFees +
             fs.accruedPerformanceFees +
@@ -253,6 +281,16 @@ library FeeManager {
             fs.accruedExitFees;
     }
 
+    /**
+     * @notice Get detailed breakdown of accrued fees by type
+     * @param fs Fee storage reference
+     * @return mgmt Accrued management fees
+     * @return perf Accrued performance fees
+     * @return entrance Accrued entrance fees
+     * @return exit Accrued exit fees
+     * @return total Total accrued fees (normalized)
+     * @return totalNative Total fees in native decimals (set by vault)
+     */
     function accruedFeesBreakdown(FeeStorage storage fs)
         external
         view
@@ -273,6 +311,13 @@ library FeeManager {
         // Note: totalNative will be calculated by vault using denormalize
     }
 
+    /**
+     * @notice Check if target liquidity threshold is met for fee payout
+     * @param fs Fee storage reference
+     * @param baseToken Base token contract
+     * @param safeWallet Safe wallet address
+     * @return Whether target liquidity is met
+     */
     function isTargetLiquidityMet(
         FeeStorage storage fs,
         IERC20 baseToken,
