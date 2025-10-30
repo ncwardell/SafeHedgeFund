@@ -41,7 +41,10 @@ library EmergencyManager {
     // ====================== EXTERNAL FUNCTIONS ======================
 
     /**
-     * @notice Trigger emergency mode (guardian)
+     * @notice Trigger emergency mode manually (guardian only)
+     * @dev Snapshots current AUM for pro-rata emergency withdrawals
+     * @param es Emergency storage reference
+     * @param currentAum Current total AUM at time of emergency trigger
      */
     function triggerEmergency(
         EmergencyStorage storage es,
@@ -55,14 +58,19 @@ library EmergencyManager {
     }
 
     /**
- * @notice Public trigger after 30 days of pause OR 30 days of stale AUM
- */
-function checkEmergencyThreshold(
-    EmergencyStorage storage es,
-    bool isPaused,
-    uint256 currentAum,
-    uint256 aumTimestamp  // NEW PARAMETER
-) external {
+     * @notice Public trigger for emergency mode after 30 days of pause or stale AUM
+     * @dev Can be called by anyone if threshold conditions are met
+     * @param es Emergency storage reference
+     * @param isPaused Whether the contract is currently paused
+     * @param currentAum Current total AUM
+     * @param aumTimestamp Timestamp of last AUM update
+     */
+    function checkEmergencyThreshold(
+        EmergencyStorage storage es,
+        bool isPaused,
+        uint256 currentAum,
+        uint256 aumTimestamp
+    ) external {
     bool pausedLongEnough = isPaused && 
         block.timestamp >= es.pauseTimestamp + EMERGENCY_THRESHOLD;
     
@@ -83,7 +91,9 @@ function checkEmergencyThreshold(
 }
 
     /**
-     * @notice Exit emergency mode (admin)
+     * @notice Exit emergency mode and restore normal operations (admin only)
+     * @dev Resets all emergency state variables
+     * @param es Emergency storage reference
      */
     function exitEmergency(EmergencyStorage storage es) external {
         if (!es.emergencyMode) return;
@@ -94,8 +104,14 @@ function checkEmergencyThreshold(
     }
 
     /**
-     * @notice Perform emergency withdrawal (pro-rata)
-     * PATCH: Fixed reentrancy by updating state before external call (HIGH-3)
+     * @notice Perform emergency withdrawal with pro-rata distribution
+     * @dev PATCH: Fixed reentrancy by updating state before external call (HIGH-3)
+     * @param es Emergency storage reference
+     * @param shares Number of shares to withdraw
+     * @param totalSupply Total share supply
+     * @param currentAum Current total AUM
+     * @param burn Function to burn shares
+     * @param payout Function to execute payout
      */
     function emergencyWithdraw(
         EmergencyStorage storage es,
@@ -129,7 +145,13 @@ function checkEmergencyThreshold(
     }
 
     /**
-     * @notice Execute payout with Safe fallback + events
+     * @notice Execute payout with Safe wallet fallback and event emission
+     * @dev Tries vault balance first, then Safe wallet if needed
+     * @param baseToken Base token contract
+     * @param user Address to receive payout
+     * @param amount Amount to payout
+     * @param safeWallet Safe wallet address for additional liquidity
+     * @param isModuleEnabled Function to check if vault is enabled as Safe module
      */
     function executePayout(
         IERC20 baseToken,
@@ -175,10 +197,23 @@ function checkEmergencyThreshold(
 
     // ====================== VIEW FUNCTIONS ======================
 
+    /**
+     * @notice Check if emergency mode is currently active
+     * @param es Emergency storage reference
+     * @return Whether emergency mode is active
+     */
     function isEmergencyActive(EmergencyStorage storage es) external view returns (bool) {
         return es.emergencyMode;
     }
 
+    /**
+     * @notice Get comprehensive emergency mode information
+     * @param es Emergency storage reference
+     * @return active Whether emergency mode is active
+     * @return snapshot AUM snapshot at emergency trigger
+     * @return withdrawn Total amount withdrawn during emergency
+     * @return pauseTime Timestamp when contract was paused
+     */
     function emergencyInfo(EmergencyStorage storage es)
         external
         view

@@ -208,6 +208,8 @@ contract SafeHedgeFundVault is
     /**
      * @notice Deposit base tokens and receive shares
      * @dev Fixed MEDIUM #9: Added validation for zero shares after fees
+     * @param amount The amount of base tokens to deposit
+     * @param minShares Minimum shares expected (slippage protection)
      */
     function deposit(uint256 amount, uint256 minShares)
         external
@@ -231,6 +233,8 @@ contract SafeHedgeFundVault is
     /**
      * @notice Redeem shares for base tokens
      * @dev Fixed MEDIUM #9: Added validation for zero amount after fees
+     * @param shares The number of shares to redeem
+     * @param minAmountOut Minimum base tokens expected (slippage protection)
      */
     function redeem(uint256 shares, uint256 minAmountOut)
         external
@@ -271,6 +275,7 @@ contract SafeHedgeFundVault is
     /**
      * @notice Update AUM and accrue management/performance fees
      * @dev Note: Issue #13 (Missing Input Validation) intentionally not fixed per user request
+     * @param newAum The new total assets under management value
      */
     function updateAum(uint256 newAum) external onlyRole(AUM_UPDATER_ROLE) {
         uint256 onChain = _getTotalOnChainLiquidity();
@@ -290,6 +295,7 @@ contract SafeHedgeFundVault is
     /**
      * @notice Process deposit queue
      * @dev Fixed MEDIUM #11: Re-checks AUM staleness during processing
+     * @param maxToProcess Maximum number of deposits to process in this batch
      */
     function processDepositQueue(uint256 maxToProcess)
         external
@@ -319,6 +325,7 @@ contract SafeHedgeFundVault is
     /**
      * @notice Process redemption queue
      * @dev Fixed MEDIUM #11: Re-checks AUM staleness during processing
+     * @param maxToProcess Maximum number of redemptions to process in this batch
      */
     function processRedemptionQueue(uint256 maxToProcess)
         external
@@ -336,14 +343,26 @@ contract SafeHedgeFundVault is
         );
     }
 
+    /**
+     * @notice Cancel pending deposits for the caller
+     * @param maxCancellations Maximum number of pending deposits to cancel
+     */
     function cancelMyDeposits(uint256 maxCancellations) external nonReentrant {
         queueStorage.cancelDeposits(msg.sender, maxCancellations, _transferBack);
     }
 
+    /**
+     * @notice Cancel pending redemptions for the caller
+     * @param maxCancellations Maximum number of pending redemptions to cancel
+     */
     function cancelMyRedemptions(uint256 maxCancellations) external nonReentrant {
         queueStorage.cancelRedemptions(msg.sender, maxCancellations, _mintBack);
     }
 
+    /**
+     * @notice Admin function to cancel a specific deposit by queue index
+     * @param queueIdx The index of the deposit in the queue
+     */
     function cancelDepositByIndex(uint256 queueIdx)
         external
         onlyRole(ADMIN_ROLE)
@@ -352,6 +371,10 @@ contract SafeHedgeFundVault is
         queueStorage.cancelDepositByIndex(queueIdx, _transferBack);
     }
 
+    /**
+     * @notice Admin function to cancel a specific redemption by queue index
+     * @param queueIdx The index of the redemption in the queue
+     */
     function cancelRedemptionByIndex(uint256 queueIdx)
         external
         onlyRole(ADMIN_ROLE)
@@ -360,6 +383,10 @@ contract SafeHedgeFundVault is
         queueStorage.cancelRedemptionByIndex(queueIdx, _mintBack);
     }
 
+    /**
+     * @notice Admin function to batch cancel multiple deposits
+     * @param indices Array of queue indices to cancel
+     */
     function batchCancelDeposits(uint256[] calldata indices)
         external
         onlyRole(ADMIN_ROLE)
@@ -368,6 +395,10 @@ contract SafeHedgeFundVault is
         queueStorage.batchCancelDeposits(indices, _transferBack);
     }
 
+    /**
+     * @notice Admin function to batch cancel multiple redemptions
+     * @param indices Array of queue indices to cancel
+     */
     function batchCancelRedemptions(uint256[] calldata indices)
         external
         onlyRole(ADMIN_ROLE)
@@ -378,6 +409,10 @@ contract SafeHedgeFundVault is
 
     // ====================== FEE MANAGEMENT ======================
 
+    /**
+     * @notice Payout all accrued fees to the fee recipient
+     * @dev Requires target liquidity threshold to be met
+     */
     function payoutAccruedFees() external onlyRole(ADMIN_ROLE) nonReentrant {
         feeStorage.payoutFees(
             baseToken,
@@ -390,6 +425,11 @@ contract SafeHedgeFundVault is
 
     // ====================== CONFIGURATION ======================
 
+    /**
+     * @notice Propose a configuration change with timelock
+     * @param key Configuration parameter key (e.g., "mgmt", "perf")
+     * @param value New value for the parameter
+     */
     function proposeConfigChange(string memory key, uint256 value)
         external
         onlyRole(ADMIN_ROLE)
@@ -397,6 +437,11 @@ contract SafeHedgeFundVault is
         configStorage.proposeChange(key, value);
     }
 
+    /**
+     * @notice Execute a pending configuration proposal after timelock
+     * @param key Configuration parameter key
+     * @param value Expected value (must match proposal)
+     */
     function executeConfigProposal(string memory key, uint256 value)
         external
         onlyRole(ADMIN_ROLE)
@@ -405,6 +450,11 @@ contract SafeHedgeFundVault is
         _applyConfigChange(keyHash, newValue);
     }
 
+    /**
+     * @notice Cancel a pending configuration proposal
+     * @param key Configuration parameter key
+     * @param value Value of the proposal to cancel
+     */
     function cancelConfigProposal(string memory key, uint256 value)
         external
         onlyRole(ADMIN_ROLE)
@@ -442,6 +492,10 @@ contract SafeHedgeFundVault is
 
     // ====================== EMERGENCY FUNCTIONS ======================
 
+    /**
+     * @notice Guardian triggers emergency mode (requires contract to be paused)
+     * @dev Snapshots current AUM for pro-rata emergency withdrawals
+     */
     function triggerEmergency()
         external
         onlyRole(GUARDIAN_ROLE)
@@ -451,6 +505,10 @@ contract SafeHedgeFundVault is
         emergencyStorage.triggerEmergency(currentAum);
     }
 
+    /**
+     * @notice Anyone can trigger emergency mode after 30 days of pause or stale AUM
+     * @dev Provides additional safety mechanism for long-term issues
+     */
     function checkEmergencyThreshold() external {
         uint256 currentAum = getTotalAum();
         emergencyStorage.checkEmergencyThreshold(
@@ -460,10 +518,17 @@ contract SafeHedgeFundVault is
         );
     }
 
+    /**
+     * @notice Admin exits emergency mode and restores normal operations
+     */
     function exitEmergency() external onlyRole(ADMIN_ROLE) {
         emergencyStorage.exitEmergency();
     }
 
+    /**
+     * @notice Allows users to withdraw their pro-rata share during emergency mode
+     * @param shares Number of shares to withdraw
+     */
     function emergencyWithdraw(uint256 shares) external nonReentrant {
         uint256 currentAum = getTotalAum();
         emergencyStorage.emergencyWithdraw(
@@ -477,31 +542,56 @@ contract SafeHedgeFundVault is
 
     // ====================== ADMIN ======================
 
+    /**
+     * @notice Pause the contract (disables deposits and redemptions)
+     * @dev Records pause timestamp for emergency threshold tracking
+     */
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
         emergencyStorage.pauseTimestamp = block.timestamp;
     }
 
+    /**
+     * @notice Unpause the contract
+     */
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
     }
 
+    /**
+     * @notice Configure automatic processing of deposits and redemptions
+     * @param deposits Enable/disable automatic deposit processing
+     * @param redemptions Enable/disable automatic redemption payouts
+     */
     function setAutoProcess(bool deposits, bool redemptions) external onlyRole(ADMIN_ROLE) {
         autoProcessDeposits = deposits;
         autoPayoutRedemptions = redemptions;
     }
 
+    /**
+     * @notice Guardian can also configure auto-processing for emergency situations
+     * @param deposits Enable/disable automatic deposit processing
+     * @param redemptions Enable/disable automatic redemption payouts
+     */
     function setAutoProcessGuardian(bool deposits, bool redemptions) external onlyRole(GUARDIAN_ROLE) {
         autoProcessDeposits = deposits;
         autoPayoutRedemptions = redemptions;
     }
 
+    /**
+     * @notice Rescue accidentally sent ERC20 tokens (except base token)
+     * @param token Address of the token to rescue
+     * @param amount Amount of tokens to rescue
+     */
     function rescueERC20(address token, uint256 amount) external onlyRole(ADMIN_ROLE) {
         if (token == address(baseToken)) revert CannotRescueBase();
         IERC20(token).safeTransfer(rescueTreasury, amount);
         emit TokensRescued(token, amount);
     }
 
+    /**
+     * @notice Rescue accidentally sent ETH
+     */
     function rescueETH() external onlyRole(ADMIN_ROLE) {
         uint256 bal = address(this).balance;
         if (bal > 0) {
@@ -650,6 +740,10 @@ contract SafeHedgeFundVault is
 
     // ====================== VIEW HELPERS ======================
 
+    /**
+     * @notice Get current NAV (Net Asset Value) per share
+     * @return Current NAV per share in 18 decimals
+     */
     function navPerShare() public view aumNotStale returns (uint256) {
         return AUMManager.getNav(
             feeStorage.aum,
@@ -660,14 +754,31 @@ contract SafeHedgeFundVault is
         );
     }
 
+    /**
+     * @notice Estimate shares to be received for a deposit amount
+     * @param amount Amount of base tokens to deposit
+     * @return Estimated shares after entrance fees
+     */
     function estimateShares(uint256 amount) external view aumNotStale returns (uint256) {
         return AUMManager.estimateShares(amount, feeStorage.entranceFeeBps, navPerShare(), _normalize);
     }
 
+    /**
+     * @notice Estimate payout for redeeming shares
+     * @param shares Number of shares to redeem
+     * @return Estimated base tokens after exit fees
+     */
     function estimatePayout(uint256 shares) external view aumNotStale returns (uint256) {
         return AUMManager.estimatePayout(shares, navPerShare(), feeStorage.exitFeeBps, _denormalize);
     }
 
+    /**
+     * @notice Get high water mark status and recovery progress
+     * @return hwm Current high water mark
+     * @return lowestNav Lowest NAV during drawdown period
+     * @return recoveryStart Timestamp when recovery period started
+     * @return daysToReset Days remaining until HWM reset
+     */
     function getHWMStatus() external view returns (uint256 hwm, uint256 lowestNav, uint256 recoveryStart, uint256 daysToReset) {
         return AUMManager.getHWMStatus(
             feeStorage.highWaterMark,
@@ -677,10 +788,24 @@ contract SafeHedgeFundVault is
         );
     }
 
+    /**
+     * @notice Get current queue lengths
+     * @return deposits Number of pending deposits
+     * @return redemptions Number of pending redemptions
+     */
     function queueLengths() external view returns (uint256 deposits, uint256 redemptions) {
         return queueStorage.queueLengths();
     }
 
+    /**
+     * @notice Get breakdown of all accrued fees
+     * @return mgmt Accrued management fees
+     * @return perf Accrued performance fees
+     * @return entrance Accrued entrance fees
+     * @return exit Accrued exit fees
+     * @return total Total accrued fees (normalized)
+     * @return totalNative Total accrued fees in native token decimals
+     */
     function accruedFees() external view returns (
         uint256 mgmt, uint256 perf, uint256 entrance, uint256 exit,
         uint256 total, uint256 totalNative
@@ -689,6 +814,14 @@ contract SafeHedgeFundVault is
         totalNative = _denormalize(total);
     }
 
+    /**
+     * @notice Get user's position details
+     * @param user Address of the user
+     * @return shares User's share balance
+     * @return value Current value of shares in base tokens
+     * @return pendingDep User's pending deposits amount
+     * @return pendingRed User's pending redemptions amount
+     */
     function getPosition(address user) external view returns (
         uint256 shares, uint256 value, uint256 pendingDep, uint256 pendingRed
     ) {
@@ -698,6 +831,10 @@ contract SafeHedgeFundVault is
         pendingRed = queueStorage.pendingRedemptions[user];
     }
 
+    /**
+     * @notice Get total AUM (Assets Under Management) after fees
+     * @return Total AUM in base token decimals
+     */
     function getTotalAum() public view returns (uint256) {
         uint256 onChain = baseToken.balanceOf(safeWallet) + baseToken.balanceOf(address(this));
         uint256 fees = _denormalize(feeStorage.totalAccruedFees());

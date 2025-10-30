@@ -60,8 +60,13 @@ library QueueManager {
     // ====================== EXTERNAL FUNCTIONS ======================
 
     /**
-     * @notice Queue a deposit
-     * @dev Fixed MEDIUM #8: Added overflow protection
+     * @notice Queue a deposit for later processing
+     * @dev Fixed MEDIUM #8: Added overflow protection for queue tail
+     * @param qs Queue storage reference
+     * @param user Address of depositor
+     * @param amount Amount of base tokens to deposit
+     * @param nav Current NAV at time of queuing
+     * @param minShares Minimum shares expected (slippage protection)
      */
     function queueDeposit(
         QueueStorage storage qs,
@@ -92,8 +97,13 @@ library QueueManager {
     }
 
     /**
-     * @notice Queue a redemption
-     * @dev Fixed MEDIUM #8: Added overflow protection
+     * @notice Queue a redemption for later processing
+     * @dev Fixed MEDIUM #8: Added overflow protection for queue tail
+     * @param qs Queue storage reference
+     * @param user Address of redeemer
+     * @param shares Number of shares to redeem
+     * @param nav Current NAV at time of queuing
+     * @param minPayout Minimum payout expected (slippage protection)
      */
     function queueRedemption(
         QueueStorage storage qs,
@@ -123,7 +133,17 @@ library QueueManager {
     }
 
     /**
-     * @notice Process one deposit from queue
+     * @notice Process a single deposit from the queue
+     * @dev Used for auto-processing deposits immediately after queuing
+     * @param qs Queue storage reference
+     * @param queueIdx Index of the deposit in the queue
+     * @param currentNav Current NAV per share
+     * @param normalize Function to normalize amounts to 18 decimals
+     * @param denormalize Function to denormalize amounts from 18 decimals
+     * @param accrueEntranceFee Function to calculate and accrue entrance fees
+     * @return success Whether the deposit was processed successfully
+     * @return sharesMinted Number of shares minted
+     * @return netAmount Net deposit amount after fees
      */
     function processSingleDeposit(
         QueueStorage storage qs,
@@ -157,7 +177,16 @@ library QueueManager {
     }
 
     /**
-     * @notice Process batch deposits with slippage check + skip events
+     * @notice Process a batch of deposits from the queue
+     * @dev Skips deposits that fail slippage checks and emits skip events
+     * @param qs Queue storage reference
+     * @param maxToProcess Maximum number of deposits to process
+     * @param currentNav Current NAV per share
+     * @param normalize Function to normalize amounts to 18 decimals
+     * @param accrueEntranceFee Function to calculate and accrue entrance fees
+     * @param emitDepositSkipped Function to emit skip events
+     * @param getMaxBatchSize Function to get maximum batch size
+     * @return processed Number of deposits successfully processed
      */
     function processDepositBatch(
         QueueStorage storage qs,
@@ -196,7 +225,14 @@ library QueueManager {
     }
 
     /**
-     * @notice Process batch redemptions with payout + skip events
+     * @notice Process a batch of redemptions from the queue
+     * @dev Skips redemptions that fail payout or slippage checks
+     * @param qs Queue storage reference
+     * @param maxToProcess Maximum number of redemptions to process
+     * @param payout Function to execute payout to user
+     * @param emitRedemptionSkipped Function to emit skip events
+     * @param getMaxBatchSize Function to get maximum batch size
+     * @return processed Number of redemptions successfully processed
      */
     function processRedemptionBatch(
         QueueStorage storage qs,
@@ -236,6 +272,14 @@ library QueueManager {
 
     // ====================== CANCELLATIONS ======================
 
+    /**
+     * @notice Cancel pending deposits for a user
+     * @param qs Queue storage reference
+     * @param user Address of the user
+     * @param maxCancellations Maximum number of deposits to cancel
+     * @param transferBack Function to transfer tokens back to user
+     * @return cancelled Total amount cancelled
+     */
     function cancelDeposits(
         QueueStorage storage qs,
         address user,
@@ -259,6 +303,14 @@ library QueueManager {
         _cleanDepositQueue(qs);
     }
 
+    /**
+     * @notice Cancel pending redemptions for a user
+     * @param qs Queue storage reference
+     * @param user Address of the user
+     * @param maxCancellations Maximum number of redemptions to cancel
+     * @param mintBack Function to mint shares back to user
+     * @return cancelled Total shares cancelled
+     */
     function cancelRedemptions(
         QueueStorage storage qs,
         address user,
@@ -356,6 +408,12 @@ library QueueManager {
 
     // ====================== VIEW FUNCTIONS ======================
 
+    /**
+     * @notice Get the current length of both queues
+     * @param qs Queue storage reference
+     * @return deposits Number of pending deposits
+     * @return redemptions Number of pending redemptions
+     */
     function queueLengths(QueueStorage storage qs)
         external
         view
@@ -365,6 +423,15 @@ library QueueManager {
         redemptions = qs.redemptionQueueTail - qs.redemptionQueueHead;
     }
 
+    /**
+     * @notice Get a paginated list of pending deposits
+     * @param qs Queue storage reference
+     * @param start Starting index for pagination
+     * @param limit Maximum number of items to return
+     * @return users Array of depositor addresses
+     * @return amounts Array of deposit amounts
+     * @return navs Array of NAV values at queue time
+     */
     function getPendingDeposits(
         QueueStorage storage qs,
         uint256 start,
@@ -397,6 +464,15 @@ library QueueManager {
         assembly { mstore(users, idx) mstore(amounts, idx) mstore(navs, idx) }
     }
 
+    /**
+     * @notice Get a paginated list of pending redemptions
+     * @param qs Queue storage reference
+     * @param start Starting index for pagination
+     * @param limit Maximum number of items to return
+     * @return users Array of redeemer addresses
+     * @return shares Array of share amounts
+     * @return navs Array of NAV values at queue time
+     */
     function getPendingRedemptions(
         QueueStorage storage qs,
         uint256 start,
