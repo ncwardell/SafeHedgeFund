@@ -13,6 +13,10 @@ import "./core/FeeManager.sol";
 import "./core/QueueManager.sol";
 import "./core/EmergencyManager.sol";
 
+interface ISharedPool {
+    function sweepLiquidations() external;
+}
+
 contract SafeHedgeFundVault is
     ERC20,
     ERC20Burnable,
@@ -84,6 +88,15 @@ contract SafeHedgeFundVault is
     uint256 public maxAumAge;
     uint256 public maxBatchSize;
 
+    // Lending config (mirrored from ConfigManager via _applyConfigChange)
+    uint256 public swapFeeBps;
+    uint256 public lltvBps;
+    uint256 public borrowRateBps;
+
+    // Pool wiring
+    address public sharedPool;
+    uint256 public lastAumBlock;
+
     IERC20 public immutable baseToken;
     address public immutable safeWallet;
     uint8 public immutable baseDecimals;
@@ -103,6 +116,9 @@ contract SafeHedgeFundVault is
     event PayoutFailed(address indexed user, uint256 amount, string reason);
     event ProposalExecutionFailed(bytes32 indexed id, string reason);
     event Initialized(uint256 timestamp);
+    event SharedPoolSet(address indexed pool);
+
+    error OnlyPool();
 
     constructor(
         address _baseToken,
@@ -239,6 +255,14 @@ contract SafeHedgeFundVault is
         );
 
         emit AumUpdated(adjustedAum, newNav);
+
+        // NAV is a step function — only changes here. So this is the unique
+        // moment where lending positions can become unhealthy. Mark the
+        // block (for pool's swap freeze) and sweep liquidations.
+        lastAumBlock = block.number;
+        if (sharedPool != address(0)) {
+            ISharedPool(sharedPool).sweepLiquidations();
+        }
     }
 
     function processDepositQueue(uint256 maxToProcess)
@@ -377,6 +401,12 @@ contract SafeHedgeFundVault is
             feeStorage.hwmRecoveryPct = value;
         } else if (keyHash == keccak256("hwmRecoveryPeriod")) {
             feeStorage.hwmRecoveryPeriod = value;
+        } else if (keyHash == keccak256("swapFeeBps")) {
+            swapFeeBps = value;
+        } else if (keyHash == keccak256("lltvBps")) {
+            lltvBps = value;
+        } else if (keyHash == keccak256("borrowRateBps")) {
+            borrowRateBps = value;
         }
     }
 
@@ -728,6 +758,31 @@ contract SafeHedgeFundVault is
             abi.encodeWithSignature("isModuleEnabled(address)", address(this))
         );
         return success && abi.decode(data, (bool));
+    }
+
+    // ── Lending pool integration ───────────────────────────────────────
+
+    modifier onlyPool() {
+        if (msg.sender != sharedPool) revert OnlyPool();
+        _;
+    }
+
+    /// @notice Wire the vault to a deployed SharedPool. One-time admin setup.
+    function setSharedPool(address pool) external onlyRole(ADMIN_ROLE) {
+        require(pool != address(0), "zero pool");
+        sharedPool = pool;
+        emit SharedPoolSet(pool);
+    }
+
+    /// @notice Pool calls this to mint HFS to a user (e.g. on USDC→HFS swap).
+    function mintForPool(address to, uint256 amount) external onlyPool {
+        _mint(to, amount);
+    }
+
+    /// @notice Pool calls this to burn HFS from a user (e.g. on HFS→USDC swap
+    /// or to burn pool's own collateral on liquidation).
+    function burnFromUser(address from, uint256 amount) external onlyPool {
+        _burn(from, amount);
     }
 
     function getFundConfig() external view returns (FundConfig memory config) {
