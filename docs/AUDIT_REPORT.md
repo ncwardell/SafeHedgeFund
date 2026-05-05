@@ -186,12 +186,36 @@ If the base token reverts on `decimals()`, the constructor silently assumes 18. 
 ### B-LOW-4 — Dead helpers
 `_emitDeposited`, `_emitTokensRescued`, `_emitETHRescued`, `_revertCannotRescueBase` (`SafeHedgeFundVault.sol:572-586`) are unused since the inlining refactor.
 
+### B-LOW-5 — Round-trip rounding loss at exact `minDeposit` for non-18-dec tokens
+**File:** `SafeHedgeFundVault.sol:201` (`if (payout < minRedemption) revert BelowMinimum()`)
+**Surfaced by:** stateless property fuzz (`testFuzz_roundTrip_noFees` with `args=[0]` → bounded to minDeposit)
+
+A user who deposits exactly `minDeposit` on a 6/8-dec token (e.g. USDC/WBTC)
+gets shares whose round-trip payout is `minDeposit − 1 wei` due to integer
+division of the AUM seed (1 native unit) through the NAV calc. The redeem
+path then rejects because `payout < minRedemption`. User is stuck with shares
+they can't redeem via the normal path (cancellation isn't an option once
+deposit is processed; emergency-withdraw works).
+
+For 18-dec tokens (`DECIMAL_FACTOR = 1`) the seed contribution rounds to zero
+and the round-trip preserves value exactly, so this only affects sub-18-dec
+deployments.
+
+**Mitigations:**
+- Set `minRedemption < minDeposit` in the constructor (e.g. `minRedemption = minDeposit / 2`).
+- Document that users should deposit > minDeposit by at least 1 wei.
+- Replace the seed-funded initial AUM with a no-seed bootstrap that doesn't
+  contribute to NAV until the first depositor.
+
+Test pinning the behaviour: `test_edge_minDepositRoundTripRoundingLoss` in
+`test/fuzz/PropertyFuzz.t.sol`.
+
 ---
 
 ## 7. Test coverage
 
 ```
-test/SafeHedgeFundVault.t.sol
+test/SafeHedgeFundVault.t.sol           — 9 regression tests
 ├─ test_B1_batchProcessing_mintsAllItems
 ├─ test_depositAndRedeemFlow                       (full deposit→AUM→redeem round trip)
 ├─ test_BCRIT1_exitFeeAccruedExactlyOnce_queuedPath
@@ -201,9 +225,14 @@ test/SafeHedgeFundVault.t.sol
 ├─ test_BHIGH2_cancellationFindsOnlyUserItems
 ├─ test_BHIGH3_emergencyWithdrawWorksWithSafeDisabled
 └─ test_BHIGH5_autoProcessZeroShares_userCanRecover
+
+test/fuzz/PropertyFuzz.t.sol            — 7 fuzzed properties × 3 decimals (6/8/18) = 21 + edge case
+test/fuzz/InvariantFuzz.t.sol           — 7 stateful invariants over 256 runs × 128 seq depth (~128K calls each)
+test/fuzz/Reentrancy.t.sol              — 3 adversarial reentrancy tests with hooked ERC-20
 ```
 
-All 9 passing.
+All passing. See `docs/FUZZING.md` for the full property/invariant catalogue,
+what was found by fuzzing (B-LOW-5), and what's NOT covered by this suite.
 
 What's still missing:
 
