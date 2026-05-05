@@ -785,6 +785,25 @@ contract SafeHedgeFundVault is
         _burn(from, amount);
     }
 
+    /// @notice Pool calls this when an event has increased the fund's USDC
+    /// holdings (a USDC→HFS swap brings USDC into the pool). The keeper's
+    /// next daily updateAum will replace this stored value with a fresh
+    /// total — but until then, fs.aum stays correct so NAV doesn't go stale.
+    /// Without this callback, a swap would mint HFS (supply ↑) without
+    /// AUM moving, and NAV would temporarily drop, opening an exploit
+    /// window for arbitrage between AMM swaps and the daily keeper update.
+    function addToAum(uint256 amount) external onlyPool {
+        feeStorage.aum += amount;
+    }
+
+    /// @notice Pool calls this when an event has decreased the fund's USDC
+    /// holdings (HFS→USDC swap pays USDC out, or liquidation writes off bad
+    /// debt of `amount`). Same rationale as addToAum: keeps NAV correct
+    /// between keeper updates.
+    function subFromAum(uint256 amount) external onlyPool {
+        feeStorage.aum = feeStorage.aum > amount ? feeStorage.aum - amount : 0;
+    }
+
     function getFundConfig() external view returns (FundConfig memory config) {
         return FundConfig({
             managementFeeBps: feeStorage.managementFeeBps,

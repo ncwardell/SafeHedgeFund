@@ -21,13 +21,14 @@ This is a decentralized hedge fund built on top of Gnosis Safe, designed to allo
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    SafeHedgeFundVault.sol                       │
-│                   (Main Contract - ERC20)                        │
+│                   (Main Contract - ERC20 / HFS)                 │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │ • Deposits → Queue → Mint Shares                         │  │
 │  │ • Redemptions → Queue → Burn Shares → Payout            │  │
 │  │ • AUM Updates → Fee Accrual → NAV Calculation           │  │
 │  │ • Emergency Mode → Direct Withdrawals                    │  │
-│  │ • Inlined Helper Functions (optimized for size)         │  │
+│  │ • Pool Callbacks (mint/burn/addToAum/subFromAum)        │  │
+│  │ • At updateAum tail: pool.sweepLiquidations()           │  │
 │  └──────────────────────────────────────────────────────────┘  │
 │                                                                  │
 │  Uses 4 Core Library Contracts (storage via library pattern):   │
@@ -38,14 +39,18 @@ This is a decentralized hedge fund built on top of Gnosis Safe, designed to allo
 │  └────────────┴────────────┴────────────┴────────────┘        │
 │  Located in: contracts/core/                                     │
 └─────────────────────────────────────────────────────────────────┘
-                    ↕ Module Calls
-┌─────────────────────────────────────────────────────────────────┐
-│                      Gnosis Safe Wallet                          │
-│     (Multi-sig wallet controlled by fund manager)                │
-│   • Holds majority of fund assets                                │
-│   • Vault is enabled as Safe module                              │
-│   • Can execute transfers on behalf of Safe                       │
-└─────────────────────────────────────────────────────────────────┘
+              ↕ Module Calls         ↕ pool callbacks
+┌─────────────────────────────┐  ┌─────────────────────────────┐
+│      Gnosis Safe Wallet      │  │   SharedPool (lending)      │
+│   (Multi-sig, off-chain ops) │  │ contracts/lending/          │
+│  • Holds majority of fund    │  │  • USDC reserve (real)      │
+│  • Vault is module           │  │  • hfsReserve (derived)     │
+│  • execTransactionFromModule │  │  • xy=k swaps               │
+└─────────────────────────────┘  │  • Borrow against HFS coll. │
+                                  │  • Auto-liquidation sweep   │
+                                  └─────────────────────────────┘
+
+See docs/LENDING.md for the lending pool design in depth.
 ```
 
 ## Key Components
@@ -503,6 +508,18 @@ This ensures manager doesn't get paid twice for same performance.
    - User loses shares even if payout fails
    - Mitigation: Slippage protection, payout verification
 
+## Lending: SharedPool
+
+A separate `contracts/lending/SharedPool.sol` provides an AMM-based swap facility AND a lending market against HFS collateral, all backed by a single USDC reserve. Same dollars do double duty.
+
+**Core property**: `hfsReserve` is a derived equation (`usdcReserve / NAV`), never stored. xy=k swaps still apply slippage, and the slippage value is captured for existing HFS holders via callback functions on the vault that update `fs.aum` atomically with each swap. NAV stays correct between daily keeper updates.
+
+**Liquidations** are bundled into `updateAum`. NAV is a step function that only changes when the keeper reports, so the only moment a position can become unhealthy is during an AUM update — we sweep at exactly that moment, no separate keeper or external bots needed.
+
+**Configuration** (swap fee, LLTV, borrow rate) goes through the existing `ConfigManager` timelock + cooldown machinery.
+
+See **`docs/LENDING.md`** for the full design, math, callback flow, and operational notes for the keeper.
+
 ## Future Enhancements (Not Implemented)
 
 - Multi-asset support (currently single base token)
@@ -520,11 +537,13 @@ This ensures manager doesn't get paid twice for same performance.
 ```
 contracts/
 ├── SafeHedgeFundVault.sol          # Main contract with inlined helper functions
-└── core/                            # Core library contracts (complex, kept separate)
-    ├── ConfigManager.sol            # Timelock-based configuration management (372 lines)
-    ├── FeeManager.sol               # Fee calculations and HWM logic (568 lines)
-    ├── QueueManager.sol             # Deposit/redemption queue management (488 lines)
-    └── EmergencyManager.sol         # Emergency withdrawal functionality (328 lines)
+├── core/                            # Core library contracts (complex, kept separate)
+│   ├── ConfigManager.sol            # Timelock-based configuration management
+│   ├── FeeManager.sol               # Fee calculations and HWM logic
+│   ├── QueueManager.sol             # Deposit/redemption queue management
+│   └── EmergencyManager.sol         # Emergency withdrawal functionality
+└── lending/
+    └── SharedPool.sol               # Unified AMM + lending market (see docs/LENDING.md)
 ```
 
 **Organization Rationale**:

@@ -7,15 +7,32 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 /// @notice Minimal interface the pool calls back into on the vault.
+/// All `*ForPool` / `*FromUser` / `*ToAum` functions are pool-only on the
+/// vault side — the vault enforces that via an onlyPool modifier checking
+/// sharedPool address.
 interface IHedgeFundVault {
     function navPerShare() external view returns (uint256);
     function lastAumBlock() external view returns (uint256);
 
-    // Pool-only privileged callbacks
+    // Privileged supply / burn callbacks
     function mintForPool(address to, uint256 amount) external;
     function burnFromUser(address from, uint256 amount) external;
 
-    // Config (read by pool every operation)
+    // AUM accounting callbacks. Called by the pool when an event changes
+    // total fund USDC value in a way that doesn't auto-balance against
+    // supply changes. Keeps fs.aum in sync between keeper updates.
+    //
+    // Used by:
+    //   - swapUsdcForHfs:   addToAum(usdcIn)   (USDC enters fund)
+    //   - swapHfsForUsdc:   subFromAum(usdcOut) (USDC leaves fund)
+    //   - sweepLiquidations: subFromAum(debt)  (loan claim written off)
+    //
+    // NOT called by borrow/repay (those are net-zero: USDC out matched
+    // by an equivalent loan-claim asset; total fund value unchanged).
+    function addToAum(uint256 amount) external;
+    function subFromAum(uint256 amount) external;
+
+    // Config (read on each operation; ConfigManager-controlled with timelock)
     function swapFeeBps() external view returns (uint256);
     function lltvBps() external view returns (uint256);
     function borrowRateBps() external view returns (uint256);
@@ -50,12 +67,17 @@ contract SharedPool is ReentrancyGuard {
 
     IHedgeFundVault public immutable vault;
     IERC20 public immutable usdc;
-    uint256 private immutable USDC_DECIMALS_FACTOR; // 10^baseDecimals, for NAV math
 
     // ── State ────────────────────────────────────────────────────────────
-    uint256 public usdcReserve; // actual USDC held by the pool (excluding lent-out)
-    uint256 public totalBorrowed; // sum of all borrowOf[u]
-    uint256 public lastInterestAccrualTimestamp;
+    /// @notice Pool's actual USDC balance (= USDC the pool holds and can
+    /// pay out). This tracks `usdc.balanceOf(address(this))` minus any
+    /// stuck dust. Borrowed USDC is OUT of the pool but still part of
+    /// fund AUM as a loan claim (see `totalBorrowed`).
+    uint256 public usdcReserve;
+
+    /// @notice Sum of all outstanding borrowOf[user]. Tracks the principal
+    /// + accrued interest the pool is owed by all borrowers.
+    uint256 public totalBorrowed;
 
     mapping(address => uint256) public collateralOf; // HFS locked, separate from AMM
     mapping(address => uint256) public borrowOf; // USDC owed (principal + accrued)
@@ -85,8 +107,6 @@ contract SharedPool is ReentrancyGuard {
     constructor(address _vault) {
         vault = IHedgeFundVault(_vault);
         usdc = vault.baseToken();
-        USDC_DECIMALS_FACTOR = 10 ** uint256(vault.baseDecimals());
-        lastInterestAccrualTimestamp = block.timestamp;
     }
 
     /// @notice Add USDC to pool reserves. v1: anyone can call (effectively
@@ -135,8 +155,24 @@ contract SharedPool is ReentrancyGuard {
     // ── Swaps ────────────────────────────────────────────────────────────
 
     /// @notice Swap USDC for HFS at xy=k against the current pool state.
-    /// Slippage applies per-swap. The slippage value is captured in NAV via
-    /// the mint changing effectiveSupply.
+    ///
+    /// Math:
+    ///   hfsRes_pre = usdcReserve_pre / NAV   (derived equation)
+    ///   k = usdcReserve_pre * hfsRes_pre
+    ///   newUsdc = usdcReserve_pre + usdcIn
+    ///   hfsOut_pure = hfsRes_pre - k / newUsdc      (xy=k slippage)
+    ///   hfsOut = hfsOut_pure * (1 - swapFeeBps/10000)  (fee retained)
+    ///
+    /// AUM accounting:
+    ///   The user paid `usdcIn` USDC into the pool (fund-controlled).
+    ///   The pool minted `hfsOut` HFS, increasing supply.
+    ///   For NAV = AUM/supply to stay correct between keeper updates, AUM
+    ///   must increase by `usdcIn` at the same time supply increases by
+    ///   `hfsOut`. We do both in this function.
+    ///
+    ///   Net NAV effect: NAV ↑ by exactly the slippage value (because the
+    ///   user paid more USDC per HFS than NAV-fair-price). That value
+    ///   accrues to existing HFS holders.
     function swapUsdcForHfs(uint256 usdcIn, uint256 minOut)
         external
         nonReentrant
@@ -158,15 +194,26 @@ contract SharedPool is ReentrancyGuard {
         usdc.safeTransferFrom(msg.sender, address(this), usdcIn);
         usdcReserve = newUsdc;
 
+        // Track AUM and supply changes atomically. Order matters: addToAum
+        // first so by the time mintForPool reads NAV (it doesn't here, but
+        // any external observer between them would see consistent state).
+        vault.addToAum(usdcIn);
         vault.mintForPool(msg.sender, hfsOut);
-        // The fee remains "absent" from the user's mint; it stays as
-        // unminted virtual capacity, captured by NAV ↑ on the next read.
 
         emit SwappedUsdcForHfs(msg.sender, usdcIn, hfsOut);
     }
 
     /// @notice Swap HFS for USDC. Burn user's HFS, send them USDC. Capped
-    /// by the pool's actual USDC reserves — beyond that, swap reverts.
+    /// by the pool's actual USDC reserves — beyond that, swap reverts and
+    /// the user falls back to the redemption queue for vault.redeem().
+    ///
+    /// AUM accounting:
+    ///   The pool burned `hfsIn` HFS, decreasing supply.
+    ///   The pool sent `usdcOut` USDC out (fund USDC down).
+    ///   For NAV preservation, AUM decreases by `usdcOut` while supply
+    ///   decreases by `hfsIn`. The slippage means usdcOut/hfsIn < NAV,
+    ///   which makes NAV ↑ for remaining holders (same direction as the
+    ///   USDC→HFS case — slippage always favors holders).
     function swapHfsForUsdc(uint256 hfsIn, uint256 minOut)
         external
         nonReentrant
@@ -186,7 +233,10 @@ contract SharedPool is ReentrancyGuard {
         if (usdcOut < minOut) revert SlippageTooHigh();
         if (usdcOut > usdcReserve) revert InsufficientPoolUsdc();
 
+        // Burn first so supply drops before AUM does (consistent ordering
+        // with the swap-in case).
         vault.burnFromUser(msg.sender, hfsIn);
+        vault.subFromAum(usdcOut);
         usdcReserve -= usdcOut;
 
         usdc.safeTransfer(msg.sender, usdcOut);
@@ -268,6 +318,22 @@ contract SharedPool is ReentrancyGuard {
         }
     }
 
+    /// @dev Liquidate one position.
+    ///
+    /// Mechanics:
+    ///   - Burn the borrower's `col` HFS collateral (supply ↓).
+    ///   - Write off `debt` USDC of loan claim (AUM ↓ by debt).
+    ///   - No actual USDC movement here: the USDC was already loaned out
+    ///     to the borrower; we just stop expecting it back.
+    ///
+    /// At the LLTV threshold (default 50%), col × NAV = 2 × debt, so the
+    /// fund effectively gains `debt` of value: it loses `debt` of loan
+    /// claim but reduces supply by col HFS worth `col × NAV = 2 × debt`.
+    /// Existing holders capture the gain via NAV ↑.
+    ///
+    /// In a bad-debt event (collateral has crashed below debt value), the
+    /// fund absorbs the gap. fs.aum drops by debt; supply drops by col ×
+    /// NAV which is now less than debt. NAV ↓ for existing holders.
     function _liquidate(address borrower) internal {
         uint256 col = collateralOf[borrower];
         uint256 debt = borrowOf[borrower];
@@ -277,19 +343,17 @@ contract SharedPool is ReentrancyGuard {
         totalBorrowed -= debt;
         _activeBorrowers.remove(borrower);
 
-        // Burn the seized HFS — supply ↓, NAV ↑ for remaining holders by
-        // (col × NAV − badDebt). If collateral fully covers the debt, NAV
-        // is neutral. If under-collateralized, the gap is absorbed as bad
-        // debt against the pool's USDC reserve.
+        // Burn the seized HFS (collateral was held in pool's HFS balance).
         if (col > 0) {
             vault.burnFromUser(address(this), col);
         }
 
-        // Bad debt: reduce reported usdcReserve by the unrecovered portion.
-        // The actual USDC balance hasn't changed (it was loaned out and not
-        // returned), but the accounting must reflect the loss so future
-        // borrow / repay flows stay consistent.
-        // (No actual USDC movement; this just zeros the lost loan claim.)
+        // Write off the loan from AUM. The USDC was lent out and not
+        // recovered — it's gone from the fund's balance sheet. fs.aum
+        // drops by debt to reflect.
+        if (debt > 0) {
+            vault.subFromAum(debt);
+        }
 
         emit Liquidated(borrower, col, debt);
     }

@@ -32,18 +32,27 @@ SafeHedgeFund is a sophisticated DeFi protocol that enables the creation and man
 - **Batch Operations**: Efficient processing of multiple queue items
 - **Liquidity Management**: Target liquidity ratio for optimal capital efficiency
 
+### Lending (SharedPool)
+- **Borrow Without Selling**: HFS holders use their shares as collateral to draw USDC. Position stays exposed to fund performance.
+- **Unified AMM + Lending**: Single USDC reserve serves both swap depth (HFS↔USDC) and borrow capacity. Same dollars, both jobs.
+- **Auto Liquidation**: Bundled into the keeper's `updateAum` flow. No external liquidation bots, no MEV dependencies.
+- **NAV-correct between updates**: Pool callbacks (`addToAum` / `subFromAum`) keep `fs.aum` synced as USDC moves through swaps.
+- **See [`docs/LENDING.md`](docs/LENDING.md)** for the full design.
+
 ## Architecture
 
 ### Contract Structure
 
 ```
 contracts/
-├── SafeHedgeFundVault.sol    # Main vault contract (ERC20 shares, core logic)
-├── AUMManager.sol             # Assets Under Management calculations and NAV tracking
-├── ConfigManager.sol          # Time-locked configuration proposal system
-├── EmergencyManager.sol       # Emergency pause and withdrawal mechanisms
-├── FeeManager.sol             # Comprehensive fee accrual and payment logic
-└── QueueManager.sol           # Deposit and redemption queue management
+├── SafeHedgeFundVault.sol    # Main vault contract (ERC20 shares = HFS, core logic)
+├── core/
+│   ├── ConfigManager.sol      # Time-locked configuration proposal system
+│   ├── EmergencyManager.sol   # Emergency pause and withdrawal mechanisms
+│   ├── FeeManager.sol         # Fee accrual + HWM logic
+│   └── QueueManager.sol       # Deposit and redemption queue management
+└── lending/
+    └── SharedPool.sol         # AMM + lending against HFS collateral
 ```
 
 ### Library Pattern
