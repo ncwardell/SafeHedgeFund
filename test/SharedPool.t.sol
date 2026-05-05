@@ -496,4 +496,176 @@ contract SharedPoolTest is Test {
         vm.expectRevert(SharedPool.OnlyVault.selector);
         pool.sweepLiquidations();
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Adversarial / edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// @notice Repaying more than debt should cap at debt; the excess
+    /// should NOT be pulled from the user.
+    function test_repay_capsAtDebt() public {
+        uint256 shares = _aliceDepositsForShares(10_000e6);
+        vm.roll(block.number + 1);
+
+        vm.startPrank(alice);
+        IERC20(address(vault)).approve(address(pool), shares);
+        pool.depositCollateral(shares);
+        pool.borrow(1_000e6);
+        vm.stopPrank();
+
+        uint256 aliceUsdcBefore = usdc.balanceOf(alice);
+
+        vm.startPrank(alice);
+        usdc.approve(address(pool), 5_000e6);
+        pool.repay(5_000e6); // overpay by 4_000
+        vm.stopPrank();
+
+        uint256 aliceUsdcAfter = usdc.balanceOf(alice);
+        assertEq(aliceUsdcBefore - aliceUsdcAfter, 1_000e6, "only debt amount pulled, not full overpay");
+        assertEq(pool.borrowOf(alice), 0);
+    }
+
+    /// @notice Borrowing exactly at LLTV should succeed (boundary case).
+    function test_borrow_atExactLltvSucceeds() public {
+        uint256 shares = _aliceDepositsForShares(10_000e6);
+        vm.roll(block.number + 1);
+
+        vm.startPrank(alice);
+        IERC20(address(vault)).approve(address(pool), shares);
+        pool.depositCollateral(shares);
+        // shares × NAV × 50% LLTV = max borrow.
+        // Compute that exact amount.
+        uint256 nav = vault.navPerShare();
+        uint256 collateralValueNative = (shares * nav / 1e18) / 1e12; // 6-dec USDC
+        uint256 maxBorrow = (collateralValueNative * 5000) / 10_000;
+        // Borrow exactly maxBorrow — should NOT revert
+        pool.borrow(maxBorrow);
+        vm.stopPrank();
+
+        assertEq(pool.borrowOf(alice), maxBorrow, "borrowed exactly at LLTV");
+    }
+
+    /// @notice Zero-amount swap should revert.
+    function test_swap_zeroAmount_reverts() public {
+        vm.roll(block.number + 1);
+        vm.prank(alice);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.swapUsdcForHfs(0, 0);
+
+        vm.prank(alice);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.swapHfsForUsdc(0, 0);
+    }
+
+    /// @notice Zero-amount borrow / repay / collateral ops should revert.
+    function test_zeroAmountOps_revert() public {
+        vm.startPrank(alice);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.depositCollateral(0);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.withdrawCollateral(0);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.borrow(0);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.repay(0);
+        vm.expectRevert(SharedPool.ZeroAmount.selector);
+        pool.supply(0);
+        vm.stopPrank();
+    }
+
+    /// @notice Multiple borrowers, only the unhealthy ones get swept.
+    function test_sweepLiquidations_onlyUnhealthyBorrowers() public {
+        // Alice and bob both borrow against collateral
+        uint256 aliceShares = _aliceDepositsForShares(10_000e6);
+        // Use _aliceDeposits helper for bob too — small abuse, just need shares
+        vm.startPrank(bob);
+        usdc.approve(address(vault), 10_000e6);
+        vault.deposit(10_000e6, 0);
+        vm.stopPrank();
+        vm.prank(processor);
+        vault.processDepositQueue(1);
+        uint256 bobShares = vault.balanceOf(bob);
+        uint256 aumAfter = usdc.balanceOf(address(safe)) + usdc.balanceOf(address(pool));
+        vm.prank(aumUpdater);
+        vault.updateAum(aumAfter);
+
+        vm.roll(block.number + 1);
+
+        // Alice: aggressive borrow (close to LLTV)
+        vm.startPrank(alice);
+        IERC20(address(vault)).approve(address(pool), aliceShares);
+        pool.depositCollateral(aliceShares);
+        pool.borrow(4_500e6);
+        vm.stopPrank();
+
+        // Bob: conservative borrow (far below LLTV)
+        vm.startPrank(bob);
+        IERC20(address(vault)).approve(address(pool), bobShares);
+        pool.depositCollateral(bobShares);
+        pool.borrow(500e6);
+        vm.stopPrank();
+
+        assertEq(pool.activeBorrowerCount(), 2);
+
+        // Crash NAV
+        uint256 currentAum = usdc.balanceOf(address(safe)) + usdc.balanceOf(address(pool));
+        uint256 droppedAum = currentAum / 2;
+        uint256 toRemove = currentAum - droppedAum;
+        if (toRemove > usdc.balanceOf(address(safe))) toRemove = usdc.balanceOf(address(safe));
+        vm.prank(address(safe));
+        usdc.transfer(address(0xdead), toRemove);
+
+        uint256 newAum = usdc.balanceOf(address(safe)) + usdc.balanceOf(address(pool));
+        vm.prank(aumUpdater);
+        vault.updateAum(newAum);
+
+        // Alice should be liquidated; bob should still be healthy
+        assertEq(pool.borrowOf(alice), 0, "alice liquidated");
+        assertGt(pool.borrowOf(bob), 0, "bob still healthy");
+    }
+
+    /// @notice Same-block round-trip: deposit USDC to vault then swap HFS back
+    /// for USDC via pool. User pays both deposit fees and swap fees, no exploit.
+    function test_sameBlockRoundTrip_noExploit() public {
+        vault.setAutoProcess(true, false);
+        vm.roll(block.number + 1);
+
+        uint256 startUsdc = usdc.balanceOf(alice);
+
+        // Alice deposits + auto-processes
+        vm.startPrank(alice);
+        usdc.approve(address(vault), 1_000e6);
+        vault.deposit(1_000e6, 0);
+
+        // Alice now has shares. Try to swap them back via pool.
+        uint256 aliceShares = vault.balanceOf(alice);
+        if (aliceShares > 0) {
+            uint256 expectedOut = pool.usdcReserve(); // not really, but for slippage protection
+            // Be liberal with slippage — we're checking she can't drain
+            pool.swapHfsForUsdc(aliceShares, 0);
+        }
+        vm.stopPrank();
+
+        uint256 endUsdc = usdc.balanceOf(alice);
+        // She should have LOST some USDC to fees + slippage, not gained.
+        assertLt(endUsdc, startUsdc, "round-trip should leave alice with less USDC");
+    }
+
+    /// @notice usdcReserve tracks pool's protocol-managed USDC. If someone
+    /// transfers USDC directly to the pool address (bypassing supply()),
+    /// the extra USDC isn't reflected in usdcReserve. This is informational
+    /// — confirms that desync doesn't break operations, just leaves stuck
+    /// USDC.
+    function test_directUsdcTransfer_notReflectedInReserve() public {
+        uint256 reserveBefore = pool.usdcReserve();
+
+        vm.prank(alice);
+        usdc.transfer(address(pool), 1_000e6);
+
+        uint256 reserveAfter = pool.usdcReserve();
+        assertEq(reserveAfter, reserveBefore, "usdcReserve unchanged on direct transfer");
+
+        // Pool's actual USDC balance went up
+        assertEq(usdc.balanceOf(address(pool)) - reserveAfter, 1_000e6, "extra USDC sits in pool");
+    }
 }

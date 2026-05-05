@@ -67,6 +67,12 @@ contract SharedPool is ReentrancyGuard {
 
     IHedgeFundVault public immutable vault;
     IERC20 public immutable usdc;
+    /// @dev Cached at construction. Saves an external call on every swap
+    /// and health check. Vault stores it as immutable too, so reading it
+    /// once and caching is safe.
+    uint8 public immutable baseDecimals;
+    /// @dev 10 ** (18 - baseDecimals). Pre-computed for normalization.
+    uint256 private immutable DECIMAL_FACTOR;
 
     // ── State ────────────────────────────────────────────────────────────
     /// @notice Pool's actual USDC balance (= USDC the pool holds and can
@@ -100,13 +106,14 @@ contract SharedPool is ReentrancyGuard {
     error InsufficientPoolUsdc();
     error InsufficientCollateral();
     error WouldBeUnhealthy();
-    error NotUnhealthy();
     error SlippageTooHigh();
     error ZeroAmount();
 
     constructor(address _vault) {
         vault = IHedgeFundVault(_vault);
         usdc = vault.baseToken();
+        baseDecimals = vault.baseDecimals();
+        DECIMAL_FACTOR = 10 ** (18 - uint256(baseDecimals));
     }
 
     /// @notice Add USDC to pool reserves. v1: anyone can call (effectively
@@ -148,7 +155,7 @@ contract SharedPool is ReentrancyGuard {
         // for a given USDC amount: hfs_native = usdc_native * 1e18 / nav.
         // But we want hfs in 18-dec since shares are 18-dec, and usdc is in
         // its native decimals. Normalize usdc into 18-dec terms first.
-        uint256 normalizedUsdc = usdcReserve * (10 ** (18 - vault.baseDecimals()));
+        uint256 normalizedUsdc = usdcReserve * DECIMAL_FACTOR;
         return (normalizedUsdc * 1e18) / nav;
     }
 
@@ -365,7 +372,7 @@ contract SharedPool is ReentrancyGuard {
         // collateral × NAV (in USDC native): denormalize the result
         uint256 nav = vault.navPerShare();
         uint256 collateralValueNormalized = (collateralOf[user] * nav) / 1e18;
-        uint256 collateralValueNative = collateralValueNormalized / (10 ** (18 - vault.baseDecimals()));
+        uint256 collateralValueNative = collateralValueNormalized / DECIMAL_FACTOR;
         uint256 maxBorrow = (collateralValueNative * vault.lltvBps()) / 10_000;
         return borrowOf[user] > maxBorrow;
     }

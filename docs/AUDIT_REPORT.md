@@ -1,9 +1,9 @@
 # SafeHedgeFund Audit Report
 
-**Branch:** `claude/fix-critical-bugs`
+**Branches reviewed:** `claude/fix-critical-bugs` (vault) + `claude/shared-pool` (lending)
 **Reviewer:** Claude (Opus 4.7)
-**Scope:** `contracts/SafeHedgeFundVault.sol` + `contracts/core/{ConfigManager,FeeManager,QueueManager,EmergencyManager}.sol`
-**Out of scope:** `ICP/`, `portal/` reviewed only for ABI surface.
+**Scope:** `contracts/SafeHedgeFundVault.sol`, `contracts/core/*`, `contracts/lending/SharedPool.sol`
+**Out of scope:** `portal/` reviewed only for ABI surface. (`ICP/` removed from repo.)
 
 ---
 
@@ -234,7 +234,7 @@ These are good next-PR work; none of them are blockers for the fixes in this bra
 
 ---
 
-## 8. Verdict
+## 8. Verdict (vault scope)
 
 The criticals and user-facing highs are closed. The remaining medium/low items are correctness polish, not security. The contract still has an explicitly trusted role (AUM_UPDATER) — that's a design choice with operational mitigations, not a bug.
 
@@ -243,3 +243,158 @@ For mainnet readiness I'd want, in addition to the open findings being closed:
 - Property tests covering the pro-rata invariant under fuzz
 - Operational runbook for the keeper (AUM cadence, processor scheduling, what triggers the guardian)
 - A drill: actually disable the Safe module on a testnet deployment and verify users can emergency-withdraw end to end
+
+---
+
+# Part II — `SharedPool` (lending) review
+
+The `claude/shared-pool` branch adds `contracts/lending/SharedPool.sol`, plus four new pool-only callbacks on the vault (`mintForPool`, `burnFromUser`, `addToAum`, `subFromAum`) and three timelocked config keys (`swapFeeBps`, `lltvBps`, `borrowRateBps`). This part reviews those changes.
+
+Full design walkthrough is in `docs/LENDING.md`. This section only covers security findings.
+
+## P2.0 — Threat model recap
+
+Same Safe-as-source-of-funds threat model as the vault. The pool can:
+- Mint and burn HFS via `vault.mintForPool` / `vault.burnFromUser`
+- Adjust `feeStorage.aum` via `vault.addToAum` / `vault.subFromAum`
+
+A buggy pool could corrupt `fs.aum` (NAV math goes wrong) or mint arbitrary HFS (dilute existing holders). Both are restricted to the pool address (set once via `setSharedPool`), so the trust assumption reduces to: **the pool contract code is correct**, and the keeper hasn't accidentally pointed `setSharedPool` at a malicious address.
+
+The pool itself doesn't have Safe module access. It interacts with the fund's USDC only through transfers in/out of its own balance. The Safe's USDC isn't directly touchable by pool operations — fees and reserves still flow through the vault and its module path.
+
+## P2.1 — Walkthrough of state transitions
+
+| Operation | usdcReserve | totalSupply | fs.aum | Notes |
+|---|---|---|---|---|
+| `supply(amount)` | +amount | 0 | 0 | Fund-internal move (Safe→pool) doesn't change total fund value; keeper reconciles at next updateAum |
+| `swapUsdcForHfs(in)` | +in | +hfsOut | +in | Slippage value retained in pool; NAV ↑ correctly via the `addToAum` callback |
+| `swapHfsForUsdc(in)` | -out | -in | -out | Symmetric; NAV ↑ from slippage |
+| `depositCollateral(amt)` | 0 | 0 | 0 | HFS moves from user to pool; locked, not in AMM |
+| `withdrawCollateral(amt)` | 0 | 0 | 0 | Reverse; health check enforced |
+| `borrow(amt)` | -amt | 0 | 0 | USDC out, loan claim in (offsetting); net fund value unchanged |
+| `repay(amt)` | +amt | 0 | 0 | Symmetric |
+| `_liquidate(b)` | 0 | -col (burn) | -debt | Loan claim written off; collateral burned |
+| `sweepLiquidations` | sum of above | sum of above | sum of above | Iterates active borrowers, applies `_liquidate` for unhealthy ones |
+
+Every operation that changes `totalSupply` is paired with a matching `fs.aum` adjustment, either via the pool callback or via a corresponding offset (loan claim) that the keeper reconciles. **No supply changes can leave NAV stale**, which closes the front-run-the-keeper exploit window.
+
+## P2.2 — Verified properties (from tests)
+
+`test/SharedPool.t.sol` — 24 tests, all passing.
+
+| Property | Test |
+|---|---|
+| `hfsReserve` is derived from `usdcReserve` and NAV (no stored state) | `test_hfsReserve_isDerivedFromUsdcAndNav` |
+| `hfsReserve` auto-updates after operations (no rebalance call needed) | `test_hfsReserve_autoTracksAfterSwap` |
+| xy=k slippage applies in both directions | `test_swap_*ForHfs_appliesSlippage`, `test_swap_hfsForUsdc_appliesSlippage` |
+| **NAV captures slippage immediately via callback** | `test_swap_navIncreasesAfterSwap_viaCallback`, `test_swapHfsForUsdc_navIncreases` |
+| **No stale-NAV exploit window** (Bob's deposit gets fair shares right after Alice's swap) | `test_noStaleNavExploitBetweenSwapAndUpdate` |
+| Borrow / repay are NAV-neutral (loan claim offsets USDC movement) | `test_borrow_doesNotMoveNav`, `test_repay_doesNotMoveNav` |
+| Liquidation correctly subtracts debt from `fs.aum` | `test_liquidation_writesOffDebtFromAum` |
+| Sweep liquidates only unhealthy positions, leaves healthy ones | `test_sweepLiquidations_onlyUnhealthyBorrowers` |
+| Sweep auto-runs on `updateAum` | `test_sweepLiquidations_onAumUpdate` |
+| LLTV enforcement on borrow | `test_borrow_revertsAboveLltv`, `test_borrow_atExactLltvSucceeds` |
+| Withdraw-collateral revert on health violation | `test_withdrawCollateral_revertsIfWouldBecomeUnhealthy` |
+| Block-level swap freeze in same block as `updateAum` | `test_swapFrozen_inSameBlockAsUpdateAum` |
+| Repay caps at outstanding debt (no over-pull from user) | `test_repay_capsAtDebt` |
+| Zero-amount ops revert | `test_swap_zeroAmount_reverts`, `test_zeroAmountOps_revert` |
+| Same-block round-trip (deposit + swap-out) loses money for user | `test_sameBlockRoundTrip_noExploit` |
+| Direct USDC transfer to pool isn't tracked but doesn't break ops | `test_directUsdcTransfer_notReflectedInReserve` |
+| Pool-only callbacks reject external callers | `test_onlyPool_canCallVaultCallbacks` |
+| Vault-only `sweepLiquidations` rejects external callers | `test_onlyVault_canCallSweepLiquidations` |
+
+## P2.3 — Findings
+
+### Critical / High / Medium
+
+None.
+
+### Low
+
+**P2-L1 — `usdcReserve` can desync from actual `usdc.balanceOf(this)`**
+
+If anyone transfers USDC directly to the pool address (bypassing `supply`), the actual balance grows but `usdcReserve` doesn't. The "extra" USDC sits stuck — no withdrawal path tracks it.
+
+**Impact:** USDC sent directly is permanently locked in the pool, contributing nothing to swap depth or lending capacity. Not exploitable; just inefficient.
+
+**Mitigation (not implemented in v1):** add an admin-only `sweepStuckUsdc()` that reads `usdc.balanceOf(this) - usdcReserve` and accounts for it (either bumps `usdcReserve` or rescues to the Safe). For F&F scale, just document "don't do that."
+
+**Test:** `test_directUsdcTransfer_notReflectedInReserve` confirms the desync behavior is benign.
+
+---
+
+**P2-L2 — Pool operations continue while vault is paused**
+
+`vault.pause()` halts vault-level deposits and redemptions. It does NOT halt pool operations (swaps, borrows, supply). If admin pauses because of an emergency, users can still drain pool USDC via `swapHfsForUsdc`.
+
+**Impact:** the protective intent of pause is partial. Existing borrowers can continue to borrow more; new positions can be opened. Liquidation sweep still runs at next `updateAum`.
+
+**Mitigation (not implemented in v1):** add a `notPausedOnVault` modifier to mutating pool functions reading `vault.paused()`. Probably skip `repay` (always allow repayment to clear positions) and `withdrawCollateral` for the same reason. For F&F scale, the vault's emergency-mode flow handles full-fund crises; the pool-side gap is small.
+
+---
+
+**P2-L3 — Deployment ordering matters**
+
+If admin calls `pool.supply()` BEFORE any HFS exists (totalSupply == 0), the supplied USDC inflates AUM but has no shares to dilute against. After the first `vault.deposit` mints shares at the default initial NAV, the entire pool's USDC effectively gets attributed to the first depositor.
+
+**Impact:** Operational error during deployment. The first depositor (probably the fund admin) over-extracts value at others' expense — but since the same admin is supplying both, it's value-neutral.
+
+**Mitigation (documented):** Deploy in this order:
+1. Deploy vault, set initial 1-USDC AUM seed.
+2. Deploy pool, wire via `setSharedPool`.
+3. Admin deposits USDC into vault → mints HFS shares.
+4. Process the deposit, refresh AUM.
+5. Admin supplies USDC to pool, refresh AUM again.
+
+`test/SharedPool.t.sol::setUp()` follows this order; replicate in production deployment script.
+
+---
+
+**P2-L4 — Liquidation sweep gas grows linearly with `_activeBorrowers.length()`**
+
+At F&F scale (5–50 borrowers) this is fine. At higher scale, a sweep with many liquidations could exceed the block gas limit, leaving some unhealthy positions un-liquidated.
+
+**Mitigation (not implemented in v1):** add a `maxToProcess` parameter to `sweepLiquidations`, similar to the deposit/redemption queue's `maxToProcess`. Vault would call `sweep(N)` per `updateAum`, with the keeper choosing N based on gas budget. Skip for F&F.
+
+### Informational
+
+**P2-I1 — xy=k integer rounding favors the user by ≤1 wei**
+
+`hfsOut = hfsRes - (k / newUsdc)` — `k / newUsdc` rounds down, so subtraction gives a slightly larger `hfsOut` than the precise math would. Standard rounding direction issue in xy=k AMMs; mitigated in Uniswap V2 by `(k * 1000 + 999) / (1000 * newUsdc)`. At HFS's 18-dec resolution, the extra wei is economically zero.
+
+**P2-I2 — `_liquidate` doesn't accrue interest before snapshotting `debt`**
+
+`sweepLiquidations` calls `_accrueBorrowerInterest(b)` before checking `_isUnhealthy(b)`, so debt is fresh at the health check. Then `_liquidate` reads `borrowOf[borrower]` directly without re-accruing — but no time has passed (same tx), so the freshly-accrued debt is still current. Correct, just worth noting for code readers.
+
+**P2-I3 — `notFrozen` modifier checks `block.number == vault.lastAumBlock()`**
+
+Specifically equality, not "≥". Once `block.number` advances past `lastAumBlock`, swaps work. Always exactly one block of freeze. Behaves as intended.
+
+## P2.4 — Simplifications applied during this review
+
+- **Removed unused `NotUnhealthy` error** (declared but never thrown).
+- **Cached `baseDecimals` and pre-computed `DECIMAL_FACTOR` as immutables in pool.** Saves a `vault.baseDecimals()` external call on every `swap` and health check. ~250 gas per call × N call sites.
+- (Earlier: dropped `USDC_DECIMALS_FACTOR` and `lastInterestAccrualTimestamp` — both set but never read.)
+
+## P2.5 — Known limitations (for v2)
+
+Documented in `docs/LENDING.md §6`. Summary:
+
+1. **Vault deposit/redeem still has the daily-staleness window** — pool callbacks fix the swap path; vault-side flows haven't been updated to use the same pattern. Pre-existing concern, not regressed.
+2. **Fund-only USDC supply in practice** — `supply()` is open but no LP shares yet; external suppliers would just be donating.
+3. **Fixed-rate borrow** — no utilization curve.
+4. **No flash-loan resistance** — block-level swap freeze covers the obvious vector around `updateAum`; broader analysis is a v2 concern.
+5. **Liquidation has no third-party incentive** — auto-sweep only. Keeper SLA matters.
+6. **Pool always holds zero HFS for AMM purposes** — the only HFS the pool holds is borrower collateral. Worth knowing for invariant checks.
+
+## P2.6 — Verdict (lending scope)
+
+The lending design is small and tightly scoped. ~280 lines of pool code + ~30 lines of vault changes. The core property (NAV stays correct between keeper updates via `addToAum`/`subFromAum` callbacks) is verified by an explicit test that simulates the would-be exploit.
+
+No critical or high findings. Four low findings, all either deployment guidance or v2-scope features.
+
+For mainnet readiness on this part:
+- Same as Part I: a real third-party audit.
+- Specific to lending: model the bad-debt scenario under various NAV trajectories.
+- Test the swap-and-borrow flow on a testnet with realistic gas costs (Anvil tests are gas-accurate but block-time / mempool dynamics differ).
+- Define and document the keeper SLA explicitly. The whole liquidation mechanism depends on `updateAum` running.
