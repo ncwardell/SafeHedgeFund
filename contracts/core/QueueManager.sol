@@ -138,6 +138,7 @@ library QueueManager {
         uint256 currentNav,
         function(uint256) view returns (uint256) normalize,
         function(uint256) internal returns (uint256, uint256) accrueEntranceFee,
+        function(address, uint256, uint256, uint256) internal mintAndDeploy,
         function(uint256, address, uint256, string memory) internal emitDepositSkipped,
         function() view returns (uint256) getMaxBatchSize
     ) internal returns (uint256 processed) {
@@ -146,7 +147,10 @@ library QueueManager {
 
         uint256 start = qs.depositQueueHead;
         for (uint256 i = 0; i < maxToProcess && start + i < qs.depositQueueTail; i++) {
-            if (_processDepositItem(qs, start + i, currentNav, normalize, accrueEntranceFee, emitDepositSkipped)) {
+            if (_processDepositItem(
+                qs, start + i, currentNav,
+                normalize, accrueEntranceFee, mintAndDeploy, emitDepositSkipped
+            )) {
                 processed++;
             }
         }
@@ -155,12 +159,19 @@ library QueueManager {
         if (processed > 0) emit QueueProcessed("deposit", processed);
     }
 
+    /// @dev Processes one deposit end-to-end: computes shares, checks slippage,
+    /// accrues the entrance fee, marks the item processed, and invokes
+    /// `mintAndDeploy` to mint shares and forward the net amount to the Safe.
+    /// Mint MUST happen here (not in a second pass) — _cleanDepositQueue
+    /// advances head past processed items, so any second pass that reads
+    /// post-cleanup head would silently miss them.
     function _processDepositItem(
         QueueStorage storage qs,
         uint256 idx,
         uint256 currentNav,
         function(uint256) view returns (uint256) normalize,
         function(uint256) internal returns (uint256, uint256) accrueEntranceFee,
+        function(address, uint256, uint256, uint256) internal mintAndDeploy,
         function(uint256, address, uint256, string memory) internal emitDepositSkipped
     ) private returns (bool success) {
         QueueItem storage item = qs.depositQueue[idx];
@@ -174,9 +185,14 @@ library QueueManager {
             emitDepositSkipped(idx, item.user, item.amount, "slippage");
             return false;
         }
+        if (shares == 0) {
+            emitDepositSkipped(idx, item.user, item.amount, "zero shares");
+            return false;
+        }
 
         item.processed = true;
         qs.pendingDeposits[item.user] -= item.amount;
+        mintAndDeploy(item.user, item.amount, shares, netAmountNative);
         return true;
     }
 

@@ -4,8 +4,8 @@ pragma solidity 0.8.24;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
 import "./core/ConfigManager.sol";
@@ -239,18 +239,15 @@ contract SafeHedgeFundVault is
     {
         uint256 nav = navPerShare();
 
-        uint256 processed = queueStorage.processDepositBatch(
+        queueStorage.processDepositBatch(
             maxToProcess,
             nav,
             _normalize,
             _accrueEntranceFee,
+            _mintAndDeploy,
             _emitDepositSkipped,
             _getMaxBatchSize
         );
-
-        if (processed > 0) {
-            _processDepositMints(queueStorage.depositQueueHead, processed, nav);
-        }
     }
 
     function processRedemptionQueue(uint256 maxToProcess)
@@ -403,6 +400,21 @@ contract SafeHedgeFundVault is
         );
     }
 
+    function isEmergencyActive() external view returns (bool) {
+        return emergencyStorage.emergencyMode;
+    }
+
+    function emergencyInfo()
+        external
+        view
+        returns (bool active, uint256 snapshot, uint256 withdrawn, uint256 pauseTime)
+    {
+        active = emergencyStorage.emergencyMode;
+        snapshot = emergencyStorage.emergencySnapshot;
+        withdrawn = emergencyStorage.emergencyTotalWithdrawn;
+        pauseTime = emergencyStorage.pauseTimestamp;
+    }
+
     function pause() external onlyRole(ADMIN_ROLE) {
         _pause();
         emergencyStorage.pauseTimestamp = block.timestamp;
@@ -474,24 +486,18 @@ contract SafeHedgeFundVault is
         }
     }
 
-    function _processDepositMints(uint256 startIdx, uint256 count, uint256 nav) internal {
-        // Inlined from ProcessingHelper
-        for (uint256 i = 0; i < count; i++) {
-            uint256 idx = startIdx + i;
-            QueueManager.QueueItem storage item = queueStorage.depositQueue[idx];
-
-            if (item.processed && item.amount > 0) {
-                (uint256 netAmountNative, ) = feeStorage.accrueEntranceFee(item.amount);
-                uint256 netAmount = _normalize(netAmountNative);
-                uint256 shares = nav > 0 ? (netAmount * 1e18) / nav : netAmount;
-
-                if (shares == 0) continue;
-
-                _mint(item.user, shares);
-                baseToken.safeTransfer(safeWallet, netAmountNative);
-                emit Deposited(item.user, item.amount, shares);
-            }
-        }
+    /// @dev Callback invoked from QueueManager.processDepositBatch once a
+    /// queue item has cleared its slippage check and had its entrance fee
+    /// accrued. Single source of truth for share minting + Safe deployment.
+    function _mintAndDeploy(
+        address user,
+        uint256 originalAmount,
+        uint256 shares,
+        uint256 netAmountNative
+    ) internal {
+        _mint(user, shares);
+        baseToken.safeTransfer(safeWallet, netAmountNative);
+        emit Deposited(user, originalAmount, shares);
     }
 
     function _payout(address user, uint256 shares, uint256 nav)
@@ -580,13 +586,16 @@ contract SafeHedgeFundVault is
     }
 
     function navPerShare() public view aumNotStale returns (uint256) {
-        // Inlined from ViewHelper
-        uint256 netAum = feeStorage.aum > feeStorage.totalAccruedFees()
-            ? feeStorage.aum - feeStorage.totalAccruedFees()
-            : 0;
         if (totalSupply() == 0) {
             return DECIMAL_FACTOR * 1e18;
         }
+        // feeStorage.aum is in native decimals; totalAccruedFees() is in 18-dec
+        // normalized form. Bring AUM into normalized space before subtracting,
+        // otherwise we subtract mixed units and the resulting NAV is off by
+        // DECIMAL_FACTOR — breaks redemptions for any non-18-dec base token.
+        uint256 normalizedAum = feeStorage.aum * DECIMAL_FACTOR;
+        uint256 fees = feeStorage.totalAccruedFees();
+        uint256 netAum = normalizedAum > fees ? normalizedAum - fees : 0;
         return (netAum * 1e18) / totalSupply();
     }
 
