@@ -46,12 +46,19 @@ library EmergencyManager {
      * @notice Storage for emergency mode state
      * @param emergencyMode Whether emergency withdrawals are active
      * @param emergencySnapshot AUM snapshot when emergency triggered (native decimals)
-     * @param emergencyTotalWithdrawn Total amount withdrawn in emergency (native decimals)
+     * @param emergencySnapshotSupply Share supply snapshot at trigger time
+     * @param emergencyTotalWithdrawn Sum of ENTITLEMENTS already claimed (native decimals).
+     *        Tracking entitlement (not actual payout) is what keeps the
+     *        proportional-cut formula self-consistent: available decreases
+     *        by `entitlement*scale` each step and remainingClaims decreases
+     *        by `entitlement`, so `scale = available/remainingClaims` stays
+     *        constant and every withdrawer gets the same fraction.
      * @param pauseTimestamp When contract was paused (for automatic emergency trigger)
      */
     struct EmergencyStorage {
         bool emergencyMode;
         uint256 emergencySnapshot;
+        uint256 emergencySnapshotSupply;
         uint256 emergencyTotalWithdrawn;
         uint256 pauseTimestamp;
     }
@@ -82,11 +89,13 @@ library EmergencyManager {
      */
     function triggerEmergency(
         EmergencyStorage storage es,
-        uint256 currentAum
+        uint256 currentAum,
+        uint256 currentSupply
     ) external {
         if (es.emergencyMode) return;
         es.emergencyMode = true;
         es.emergencySnapshot = currentAum;
+        es.emergencySnapshotSupply = currentSupply;
         es.emergencyTotalWithdrawn = 0;
         emit EmergencyToggled(true);
     }
@@ -118,25 +127,27 @@ library EmergencyManager {
         EmergencyStorage storage es,
         bool isPaused,
         uint256 currentAum,
+        uint256 currentSupply,
         uint256 aumTimestamp
     ) external {
-    bool pausedLongEnough = isPaused &&
-        block.timestamp >= es.pauseTimestamp + EMERGENCY_THRESHOLD;
+        bool pausedLongEnough = isPaused &&
+            block.timestamp >= es.pauseTimestamp + EMERGENCY_THRESHOLD;
 
-    bool aumStaleLongEnough =
-        block.timestamp >= aumTimestamp + EMERGENCY_THRESHOLD;
+        bool aumStaleLongEnough =
+            block.timestamp >= aumTimestamp + EMERGENCY_THRESHOLD;
 
-    if (!pausedLongEnough && !aumStaleLongEnough) {
-        revert ThresholdNotMet();
+        if (!pausedLongEnough && !aumStaleLongEnough) {
+            revert ThresholdNotMet();
+        }
+
+        if (es.emergencyMode) return;
+
+        es.emergencyMode = true;
+        es.emergencySnapshot = currentAum;
+        es.emergencySnapshotSupply = currentSupply;
+        es.emergencyTotalWithdrawn = 0;
+        emit EmergencyToggled(true);
     }
-
-    if (es.emergencyMode) return;
-
-    es.emergencyMode = true;
-    es.emergencySnapshot = currentAum;
-    es.emergencyTotalWithdrawn = 0;
-    emit EmergencyToggled(true);
-}
 
     /**
      * @notice Exits emergency mode (Admin only)
@@ -189,22 +200,39 @@ library EmergencyManager {
      * @param burn Function pointer to burn shares from user
      * @param payout Function pointer to send tokens to user
      */
+    /// @dev Pro-rata withdrawal from the emergency snapshot.
+    ///
+    /// Entitlement uses the SUPPLY SNAPSHOT (es.emergencySnapshotSupply), not
+    /// the live totalSupply. Each successful emergencyWithdraw burns shares,
+    /// so the live total drops; if we used the live value, every later
+    /// withdrawer would over-claim against a smaller denominator. This was
+    /// B-CRIT-3 — the architecture doc said the supply was meant to be
+    /// snapshotted; the original code missed it.
+    ///
+    /// `available` is passed in by the caller and SHOULD be the vault's own
+    /// balance (not vault+Safe). In emergency mode we never touch the Safe
+    /// (B-HIGH-3), so the available pool is whatever sits in the vault.
+    ///
+    /// Tracking += entitlement (not payout) is intentional: it keeps
+    /// `available/remainingClaims` constant across sequential calls, so
+    /// every user ends up with the same proportional cut of the pool.
     function emergencyWithdraw(
         EmergencyStorage storage es,
         uint256 shares,
-        uint256 totalSupply,
-        uint256 currentAum,
+        uint256 /* unused: kept for callsite compatibility */,
+        uint256 available,
         function(address, uint256) internal burn,
         function(address, uint256) internal payout
     ) internal {
         if (!es.emergencyMode) revert NotInEmergency();
-        if (shares == 0 || totalSupply == 0) revert NoSupply();
+        if (shares == 0 || es.emergencySnapshotSupply == 0) revert NoSupply();
 
-        uint256 entitlement = (shares * es.emergencySnapshot) / totalSupply;
-        uint256 available = currentAum;
-        uint256 remainingClaims = es.emergencySnapshot - es.emergencyTotalWithdrawn;
+        uint256 entitlement = (shares * es.emergencySnapshot) / es.emergencySnapshotSupply;
+        uint256 remainingClaims = es.emergencySnapshot > es.emergencyTotalWithdrawn
+            ? es.emergencySnapshot - es.emergencyTotalWithdrawn
+            : 0;
 
-        uint256 payoutAmount = available >= remainingClaims
+        uint256 payoutAmount = (available >= remainingClaims || remainingClaims == 0)
             ? entitlement
             : (entitlement * available) / remainingClaims;
 
@@ -217,65 +245,35 @@ library EmergencyManager {
     }
 
     /**
-     * @notice Executes emergency payout trying vault first, then Safe if needed
-     * @dev Helper function for emergency withdrawals and failed auto-redemptions.
-     *      Attempts to send funds from vault balance, falls back to Safe module call.
+     * @notice Executes an emergency payout from the vault's own balance only.
+     * @dev B-HIGH-3: Emergency mode exists precisely for the case where the
+     *      Safe module is gone (compromised manager disables module, or Safe
+     *      keys lost). Calling into the Safe here would brick the very
+     *      crisis path the function is supposed to provide. Pay only what
+     *      the vault holds; the pro-rata math in emergencyWithdraw already
+     *      handles partial liquidity by shrinking later withdrawers' shares
+     *      of the remaining pool.
      *
-     * WHY IT'S IMPORTANT:
-     * - Maximizes chance of successful payout during emergency
-     * - Uses vault funds first (no Safe interaction needed)
-     * - Falls back to Safe only if vault balance insufficient
-     * - Emits detailed events for monitoring failures
-     *
-     * SAFETY FEATURES:
-     * - Checks if vault is enabled as Safe module
-     * - Emits PayoutFailed event with reason for monitoring
-     * - Reverts with specific errors for debugging
+     *      For non-emergency redemptions, see _payout in the main vault —
+     *      that path correctly goes through the Safe module.
      *
      * @param baseToken Token contract to transfer
      * @param user Recipient address
-     * @param amount Amount to send (native decimals)
-     * @param safeWallet Safe wallet address
-     * @param isModuleEnabled Function to check if vault is enabled Safe module
+     * @param amount Requested amount (native decimals); we may pay less
      */
     function executePayout(
         IERC20 baseToken,
         address user,
-        uint256 amount,
-        address safeWallet,
-        function() view returns (bool) isModuleEnabled
+        uint256 amount
     ) internal {
+        if (amount == 0) return;
         uint256 vaultBal = baseToken.balanceOf(address(this));
-
-        if (vaultBal >= amount) {
-            baseToken.safeTransfer(user, amount);
+        uint256 toPay = amount > vaultBal ? vaultBal : amount;
+        if (toPay == 0) {
+            emit PayoutFailed(user, amount, "vault empty");
             return;
         }
-
-        if (vaultBal > 0) {
-            baseToken.safeTransfer(user, vaultBal);
-        }
-
-        uint256 remaining = amount - vaultBal;
-        if (remaining == 0) return;
-
-        if (!isModuleEnabled()) {
-            emit PayoutFailed(user, remaining, "module not enabled");
-            revert ModuleNotEnabled();
-        }
-
-        bytes memory data = abi.encodeWithSelector(IERC20.transfer.selector, user, remaining);
-        (bool success, ) = safeWallet.call(
-            abi.encodeWithSignature(
-                "execTransactionFromModule(address,uint256,bytes,uint8)",
-                address(baseToken), 0, data, 0
-            )
-        );
-
-        if (!success) {
-            emit PayoutFailed(user, remaining, "Safe exec failed");
-            revert PayoutExecutionFailed();
-        }
+        baseToken.safeTransfer(user, toPay);
     }
 
     /**
@@ -307,7 +305,8 @@ library EmergencyManager {
      * @param es Emergency storage reference
      * @return active Whether emergency mode is on
      * @return snapshot AUM snapshot at emergency trigger
-     * @return withdrawn Total amount withdrawn so far
+     * @return snapshotSupply Share supply snapshot at emergency trigger
+     * @return withdrawn Total entitlement claimed so far
      * @return pauseTime Timestamp when contract was paused
      */
     function emergencyInfo(EmergencyStorage storage es)
@@ -316,12 +315,14 @@ library EmergencyManager {
         returns (
             bool active,
             uint256 snapshot,
+            uint256 snapshotSupply,
             uint256 withdrawn,
             uint256 pauseTime
         )
     {
         active = es.emergencyMode;
         snapshot = es.emergencySnapshot;
+        snapshotSupply = es.emergencySnapshotSupply;
         withdrawn = es.emergencyTotalWithdrawn;
         pauseTime = es.pauseTimestamp;
     }
