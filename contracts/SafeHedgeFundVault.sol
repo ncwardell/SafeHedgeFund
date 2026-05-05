@@ -189,7 +189,14 @@ contract SafeHedgeFundVault is
         aumNotStale
         nonReentrant
     {
-        if (shares == 0 || balanceOf(msg.sender) < shares) revert InvalidShares();
+        uint256 userBalance = balanceOf(msg.sender);
+        if (shares == 0 || userBalance < shares) revert InvalidShares();
+        // B-LOW-5: full-exit override. minRedemption is a dust-spam guard;
+        // it shouldn't block a user from fully closing their position when
+        // round-trip rounding (worst case ~1 wei on non-18-dec tokens)
+        // makes payout fall just under minRedemption. Slippage protection
+        // (minAmountOut) is the user's own check and still applies.
+        bool fullExit = (shares == userBalance);
 
         uint256 nav = navPerShare();
         uint256 gross = (shares * nav) / 1e18;
@@ -200,7 +207,7 @@ contract SafeHedgeFundVault is
         if (net == 0) revert ZeroAmountCalculated();
 
         uint256 payout = _denormalize(net);
-        if (payout < minRedemption) revert BelowMinimum();
+        if (!fullExit && payout < minRedemption) revert BelowMinimum();
         if (payout < minAmountOut) revert SlippageTooHigh();
 
         // INVARIANT: _burn must be reverted by any failure on the path below.
@@ -439,6 +446,11 @@ contract SafeHedgeFundVault is
 
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
+        // B-MED-3: clear the pause timestamp so a future
+        // checkEmergencyThreshold() call doesn't see stale data and trip
+        // the auto-emergency window on a subsequent pause that hasn't
+        // actually been in effect for 30 days.
+        delete emergencyStorage.pauseTimestamp;
     }
 
     function setAutoProcess(bool deposits, bool redemptions) external onlyRole(ADMIN_ROLE) {

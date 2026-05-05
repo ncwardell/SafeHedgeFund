@@ -74,20 +74,12 @@ abstract contract PropertyFuzzBase is FuzzBase {
         assertApproxEqAbs(received, amount, tolerance, "round-trip value preserved");
     }
 
-    /// @notice Documents the rounding edge case (B-LOW-5).
-    /// On 6-dec / 8-dec tokens, depositing exactly minDeposit means after
-    /// updateAum the recomputed NAV is fractionally above 1e18 due to the
-    /// AUM seed (1 native unit). User's shares = floor(amount / nav) loses
-    /// 1 wei, redeem payout = floor(shares * nav) loses 1 wei, and the
-    /// minRedemption check rejects.
-    ///
-    /// The bug manifests for non-18-dec tokens because DECIMAL_FACTOR > 1
-    /// means the 1-unit seed shows up in the normalized AUM as DECIMAL_FACTOR
-    /// (much larger relative to a small deposit). For 18-dec tokens,
-    /// DECIMAL_FACTOR=1 and the seed is rounded out of the NAV calc.
-    function test_edge_minDepositRoundTripRoundingLoss() public {
-        if (_decimals() == 18) return; // 18-dec doesn't exhibit this
-
+    /// @notice Originally documented the round-trip rounding bug
+    /// (B-LOW-5). Post-fix, the redeem path has a full-exit exemption from
+    /// the minRedemption check: when the user redeems their entire balance,
+    /// the dust-spam guard is skipped so a 1-wei rounding loss can't lock
+    /// them in. This test now asserts the corrected behaviour.
+    function test_edge_minDepositRoundTripFullExit() public {
         token.mint(user, minDeposit);
         vm.startPrank(user);
         token.approve(address(vault), minDeposit);
@@ -97,9 +89,43 @@ abstract contract PropertyFuzzBase is FuzzBase {
         _refreshAum();
 
         uint256 shares = vault.balanceOf(user);
+        uint256 balBefore = token.balanceOf(user);
+
+        vm.prank(user);
+        // Full exit must succeed even on 6/8-dec tokens where round-trip
+        // rounding makes payout fall ~1 wei short of minRedemption.
+        vault.redeem(shares, 0);
+        _processOneRedemption();
+
+        uint256 received = token.balanceOf(user) - balBefore;
+        // Exactly minDeposit OR minDeposit - 1 wei (depending on rounding).
+        assertGe(received, minDeposit - 2, "full exit must pay close to minDeposit");
+        assertLe(received, minDeposit, "full exit must not pay more than deposit");
+        assertEq(vault.balanceOf(user), 0, "all shares burned");
+    }
+
+    /// @notice Partial redemptions still hit the minRedemption guard. The
+    /// full-exit exemption applies only when the user is closing their
+    /// entire position.
+    function test_partialRedemption_stillHonorsMinRedemption() public {
+        // Deposit enough to mint plenty of shares.
+        uint256 amount = 100 * minDeposit;
+        token.mint(user, amount);
+        vm.startPrank(user);
+        token.approve(address(vault), amount);
+        vault.deposit(amount, 0);
+        vm.stopPrank();
+        _processOneDeposit();
+        _refreshAum();
+
+        uint256 shares = vault.balanceOf(user);
+        // Tiny partial redemption — payout will be way below minRedemption.
+        uint256 tinyShares = shares / 1000000; // ~ minDeposit / 10000 worth
+        if (tinyShares == 0) return;
+
         vm.prank(user);
         vm.expectRevert(SafeHedgeFundVault.BelowMinimum.selector);
-        vault.redeem(shares, 0);
+        vault.redeem(tinyShares, 0);
     }
 
     // ── Property 2: exit fee never exceeds the configured bps ──

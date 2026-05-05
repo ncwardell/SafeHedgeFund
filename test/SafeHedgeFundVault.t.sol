@@ -332,6 +332,81 @@ contract SafeHedgeFundVaultTest is Test {
     /// user could hit gas limits and be unable to cancel.
     /// Post-fix: iterate userDepositIndices directly. We assert correctness
     /// here (not gas — gas behaviour follows from the change).
+    // ── B-MED-1: HWM uses gross NAV so perf fee isn't re-charged ────────
+
+    /// @notice Pre-fix: HWM was bumped to newNavPerShare (post-fee), so a
+    /// no-op updateAum after a perf fee charge would re-charge perf fee on
+    /// the spread between gross NAV and post-fee NAV. Post-fix: HWM tracks
+    /// gross NAV, so a no-op update accrues zero additional perf fee.
+    function test_BMED1_noPerfFeeOnNoOpUpdate() public {
+        _setFeeBps("perf", 2000); // 20%
+
+        // Alice deposits and processes.
+        _depositFrom(alice, 10_000e6);
+        vm.prank(processor);
+        vault.processDepositQueue(1);
+        _refreshAum();
+
+        // Simulate AUM growth: mint a bunch into the safe (off-chain
+        // returns) and update.
+        usdc.mint(address(safe), 5_000e6); // 50% growth
+        uint256 grownAum = usdc.balanceOf(address(safe));
+        vm.prank(aumUpdater);
+        vault.updateAum(grownAum);
+
+        ( , uint256 perfAfterGrowth, , , , ) = vault.accruedFees();
+        assertGt(perfAfterGrowth, 0, "perf fee must accrue on growth");
+
+        // No-op update at the same AUM. Pre-fix this would re-charge perf
+        // fee on the post-fee→pre-fee spread.
+        vm.prank(aumUpdater);
+        vault.updateAum(grownAum);
+
+        ( , uint256 perfAfterNoOp, , , , ) = vault.accruedFees();
+        assertEq(perfAfterNoOp, perfAfterGrowth, "no-op update must not bump perf fee");
+    }
+
+    // ── B-MED-3: pauseTimestamp cleared on unpause ──────────────────────
+
+    function test_BMED3_pauseTimestampClearedOnUnpause() public {
+        vault.pause();
+        (, , , , uint256 pauseTime) = vault.emergencyInfo();
+        assertGt(pauseTime, 0, "pause sets timestamp");
+
+        vault.unpause();
+        (, , , , pauseTime) = vault.emergencyInfo();
+        assertEq(pauseTime, 0, "unpause must clear pauseTimestamp");
+    }
+
+    // ── B-LOW-5: full-exit exemption from minRedemption ────────────────
+
+    /// @notice After the fix, a user whose payout would be 1 wei below
+    /// minRedemption due to round-trip rounding can still close their
+    /// position via the normal redeem path.
+    function test_BLOW5_fullExitBypassesMinRedemption() public {
+        // Set minRedemption equal to MIN_DEPOSIT so any round-trip rounding
+        // would otherwise trigger BelowMinimum on full exit.
+        // (Constructor already wires them equal; no change needed.)
+
+        _depositFrom(alice, MIN_DEPOSIT);
+        vm.prank(processor);
+        vault.processDepositQueue(1);
+        _refreshAum();
+
+        uint256 shares = vault.balanceOf(alice);
+        uint256 balBefore = usdc.balanceOf(alice);
+
+        // Full exit — must succeed even if payout is ~1 wei under minRedemption.
+        vm.prank(alice);
+        vault.redeem(shares, 0);
+        vm.prank(processor);
+        vault.processRedemptionQueue(1);
+
+        assertEq(vault.balanceOf(alice), 0);
+        // We got close to minDeposit back (within 2 wei rounding).
+        assertGe(usdc.balanceOf(alice), balBefore + MIN_DEPOSIT - 2);
+    }
+
     /// @notice Per-user cancellation must touch only that user's items
     /// regardless of who else is in the queue. We assert via balances
     /// (the most direct invariant): each user gets exactly their queued

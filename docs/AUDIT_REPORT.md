@@ -45,8 +45,11 @@ The remaining open findings (`B-MED-*`, `B-LOW-*`) are correctness, ergonomics, 
 | B-HIGH-4 — `_payout` fee transfer encodes wrong amount | High | **Fixed** (deleted) | this PR |
 | B-HIGH-5 — auto-process zero-shares strand | High | **Fixed** | this PR |
 | B-HIGH-1 (audit residue) — entitlement vs payout in emergency | — | **Withdrawn**: math review showed `+= entitlement` is the correct accounting. See §3 for the analysis. |
+| B-MED-1 — perf fee charged on pre-fee NAV, HWM updated to post-fee NAV | Medium | **Fixed** (cleanup PR) |
+| B-MED-3 — pauseTimestamp not cleared on unpause | Medium | **Fixed** (cleanup PR) |
+| B-LOW-5 — round-trip rounding loss at exact minDeposit (non-18-dec) | Low | **Fixed** (cleanup PR) |
 
-Open findings (correctness/ergonomics, none escalating to fund loss): B-MED-1 through B-MED-4, B-LOW-1 through B-LOW-4. See §5.
+Open findings (correctness/ergonomics, none escalating to fund loss): B-MED-2, B-MED-4, B-LOW-1 through B-LOW-4. See §5.
 
 ---
 
@@ -158,17 +161,19 @@ For each, the structural fix and the regression test that demonstrates it.
 
 None of these are exploitable for fund loss. They're correctness/ergonomics/dead-code items; bundle into a follow-up PR.
 
-### B-MED-1 — Performance fee uses pre-fee NAV, HWM uses post-fee NAV
-**File:** `FeeManager.sol:205-210` vs `FeeManager.sol:152-157`
-Performance fee charged against `tempNav` (pre-fee), HWM bumped to `newNavPerShare` (post-fee). Slowly favors manager. Either iterate to a fixed point or update HWM to `tempNav`.
+### ~~B-MED-1~~ — Fixed in cleanup PR
+~~Performance fee charged against `tempNav` (pre-fee), HWM bumped to `newNavPerShare` (post-fee).~~
+**Fix:** `_accrueFees` now returns the gross NAV to the caller, which passes it to `_updateHighWaterMark` instead of the post-fee `newNavPerShare`. HWM tracks the value the perf fee was just charged against, so a no-op update at the same AUM doesn't re-charge fees on the spread.
+**Test:** `test_BMED1_noPerfFeeOnNoOpUpdate`.
 
 ### B-MED-2 — `getTotalAum` ≠ `feeStorage.aum` (naming, not math)
 **File:** `SafeHedgeFundVault.sol:675-680`
 `getTotalAum()` returns on-chain liquidity minus fees; `feeStorage.aum` is the last reported total. Both are valid concepts but the names don't communicate the difference. Rename to `getOnChainLiquidity()` and `getReportedAum()`.
 
-### B-MED-3 — `pauseTimestamp` not cleared on `unpause`
-**File:** `SafeHedgeFundVault.sol:418-425`
-Stale value lingers after unpause; live invocation paths overwrite it on the next pause but defensive cleanup is cheap and removes a class of timing-confusion bugs.
+### ~~B-MED-3~~ — Fixed in cleanup PR
+~~Stale `pauseTimestamp` lingers after unpause.~~
+**Fix:** `unpause()` now `delete`s `emergencyStorage.pauseTimestamp`.
+**Test:** `test_BMED3_pauseTimestampClearedOnUnpause`.
 
 ### B-MED-4 — `_getDecimals` silent fallback to 18
 **File:** `SafeHedgeFundVault.sol:694-697`
@@ -186,29 +191,10 @@ If the base token reverts on `decimals()`, the constructor silently assumes 18. 
 ### B-LOW-4 — Dead helpers
 `_emitDeposited`, `_emitTokensRescued`, `_emitETHRescued`, `_revertCannotRescueBase` (`SafeHedgeFundVault.sol:572-586`) are unused since the inlining refactor.
 
-### B-LOW-5 — Round-trip rounding loss at exact `minDeposit` for non-18-dec tokens
-**File:** `SafeHedgeFundVault.sol:201` (`if (payout < minRedemption) revert BelowMinimum()`)
-**Surfaced by:** stateless property fuzz (`testFuzz_roundTrip_noFees` with `args=[0]` → bounded to minDeposit)
-
-A user who deposits exactly `minDeposit` on a 6/8-dec token (e.g. USDC/WBTC)
-gets shares whose round-trip payout is `minDeposit − 1 wei` due to integer
-division of the AUM seed (1 native unit) through the NAV calc. The redeem
-path then rejects because `payout < minRedemption`. User is stuck with shares
-they can't redeem via the normal path (cancellation isn't an option once
-deposit is processed; emergency-withdraw works).
-
-For 18-dec tokens (`DECIMAL_FACTOR = 1`) the seed contribution rounds to zero
-and the round-trip preserves value exactly, so this only affects sub-18-dec
-deployments.
-
-**Mitigations:**
-- Set `minRedemption < minDeposit` in the constructor (e.g. `minRedemption = minDeposit / 2`).
-- Document that users should deposit > minDeposit by at least 1 wei.
-- Replace the seed-funded initial AUM with a no-seed bootstrap that doesn't
-  contribute to NAV until the first depositor.
-
-Test pinning the behaviour: `test_edge_minDepositRoundTripRoundingLoss` in
-`test/fuzz/PropertyFuzz.t.sol`.
+### ~~B-LOW-5~~ — Fixed in cleanup PR
+~~Depositing exactly `minDeposit` on a 6/8-dec token round-tripped to `minDeposit − 1 wei`, tripping the `minRedemption` check inside `redeem()`.~~
+**Fix:** `redeem()` now skips the `minRedemption` check when `shares == balanceOf(msg.sender)` (full-exit override). The check exists as a dust-spam guard for partial redemptions; it shouldn't block users from fully closing their position when round-trip rounding eats a wei or two. The `minAmountOut` slippage guard still applies on every redeem.
+**Tests:** `test_BLOW5_fullExitBypassesMinRedemption` (full exit succeeds), `test_partialRedemption_stillHonorsMinRedemption` (dust-spam guard still works for partials), `test_edge_minDepositRoundTripFullExit` in `PropertyFuzz.t.sol` (parameterized over decimals).
 
 ---
 

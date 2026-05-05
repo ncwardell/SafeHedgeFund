@@ -139,7 +139,8 @@ library FeeManager {
         if (newAum == 0) revert AUMZero();
         if (newAum < onChainLiquidity) revert AUMBelowOnChain();
 
-        (uint256 mgmtFee, uint256 perfFee) = _accrueFees(fs, newAum, totalSupply, normalize);
+        (uint256 mgmtFee, uint256 perfFee, uint256 grossNav) =
+            _accrueFees(fs, newAum, totalSupply, normalize);
 
         adjustedAum = newAum - denormalize(
             fs.accruedManagementFees + fs.accruedPerformanceFees +
@@ -154,7 +155,15 @@ library FeeManager {
             : 1e18;
 
         fs.navPerShare = newNavPerShare;
-        _updateHighWaterMark(fs, newNavPerShare);
+        // B-MED-1: HWM tracks the gross (pre-fee) NAV that we just charged
+        // perf fee against, NOT the post-fee NAV. Pre-fix: HWM was bumped
+        // to newNavPerShare (which is gross minus fees just charged), so
+        // next update would re-charge perf fee on the spread between
+        // newNavPerShare and the next gross NAV — even when no real
+        // performance had occurred. The supply==0 case still seeds HWM at
+        // par (1e18) so the first depositor doesn't get hit with a perf
+        // fee on the entire opening NAV.
+        _updateHighWaterMark(fs, totalSupply > 0 ? grossNav : newNavPerShare);
 
         if (mgmtFee > 0 || perfFee > 0) {
             emit FeesAccrued(mgmtFee, perfFee, 0, 0);
@@ -189,12 +198,17 @@ library FeeManager {
         uint256 newAum,
         uint256 totalSupply,
         function(uint256) view returns (uint256) normalize
-    ) private returns (uint256 mgmtFee, uint256 perfFee) {
-        if (totalSupply == 0) return (0, 0);
+    ) private returns (uint256 mgmtFee, uint256 perfFee, uint256 grossNav) {
+        if (totalSupply == 0) return (0, 0, 0);
 
         uint256 timeDelta = block.timestamp - fs.aumTimestamp;
         if (timeDelta > MAX_TIME_DELTA) timeDelta = MAX_TIME_DELTA;
-        if (timeDelta > 3 days) return (0, 0);
+        // grossNav is computed regardless of timeDelta — the caller uses
+        // it to update HWM, which must reflect the current gross NAV
+        // even on rapid back-to-back AUM updates.
+        grossNav = (normalize(newAum) * 1e18) / totalSupply;
+
+        if (timeDelta > 3 days) return (0, 0, grossNav);
 
         if (fs.managementFeeBps > 0) {
             mgmtFee = ((fs.navPerShare * fs.managementFeeBps / FEE_DENOMINATOR) * timeDelta * totalSupply)
@@ -202,9 +216,8 @@ library FeeManager {
             fs.accruedManagementFees += mgmtFee;
         }
 
-        uint256 tempNav = (normalize(newAum) * 1e18) / totalSupply;
-        if (tempNav > fs.highWaterMark && fs.performanceFeeBps > 0) {
-            perfFee = ((tempNav - fs.highWaterMark) * fs.performanceFeeBps * totalSupply)
+        if (grossNav > fs.highWaterMark && fs.performanceFeeBps > 0) {
+            perfFee = ((grossNav - fs.highWaterMark) * fs.performanceFeeBps * totalSupply)
                 / FEE_DENOMINATOR / 1e18;
             fs.accruedPerformanceFees += perfFee;
         }
