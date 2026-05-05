@@ -193,7 +193,9 @@ contract SafeHedgeFundVault is
 
         uint256 nav = navPerShare();
         uint256 gross = (shares * nav) / 1e18;
-        (uint256 net, ) = feeStorage.accrueExitFee(gross);
+        // Preview only — exit fee is recorded inside _payout when the actual
+        // transfer succeeds (B-CRIT-1).
+        (uint256 net, ) = feeStorage.previewExitFee(gross);
 
         if (net == 0) revert ZeroAmountCalculated();
 
@@ -201,6 +203,9 @@ contract SafeHedgeFundVault is
         if (payout < minRedemption) revert BelowMinimum();
         if (payout < minAmountOut) revert SlippageTooHigh();
 
+        // INVARIANT: _burn must be reverted by any failure on the path below.
+        // queueRedemption MUST revert (not return false) when it can't queue,
+        // so that we don't end up with shares burned but no claim recorded.
         _burn(msg.sender, shares);
 
         if (autoPayoutRedemptions) {
@@ -243,7 +248,8 @@ contract SafeHedgeFundVault is
             maxToProcess,
             nav,
             _normalize,
-            _accrueEntranceFee,
+            _previewEntranceFee,
+            _recordEntranceFee,
             _mintAndDeploy,
             _emitDepositSkipped,
             _getMaxBatchSize
@@ -373,7 +379,7 @@ contract SafeHedgeFundVault is
         whenPaused
     {
         uint256 currentAum = getTotalAum();
-        emergencyStorage.triggerEmergency(currentAum);
+        emergencyStorage.triggerEmergency(currentAum, totalSupply());
     }
 
     function checkEmergencyThreshold() external {
@@ -381,6 +387,7 @@ contract SafeHedgeFundVault is
         emergencyStorage.checkEmergencyThreshold(
             paused(),
             currentAum,
+            totalSupply(),
             feeStorage.aumTimestamp
         );
     }
@@ -390,11 +397,14 @@ contract SafeHedgeFundVault is
     }
 
     function emergencyWithdraw(uint256 shares) external nonReentrant {
-        uint256 currentAum = getTotalAum();
+        // B-HIGH-3: pay only from vault balance during emergency. Including
+        // the Safe in `available` would inflate the pro-rata denominator
+        // beyond what we can actually pay, leaving late users short.
+        uint256 vaultLiquidity = baseToken.balanceOf(address(this));
         emergencyStorage.emergencyWithdraw(
             shares,
-            totalSupply(),
-            currentAum,
+            0, // legacy arg, ignored — see EmergencyManager
+            vaultLiquidity,
             _burnShares,
             _emergencyPayout
         );
@@ -407,10 +417,17 @@ contract SafeHedgeFundVault is
     function emergencyInfo()
         external
         view
-        returns (bool active, uint256 snapshot, uint256 withdrawn, uint256 pauseTime)
+        returns (
+            bool active,
+            uint256 snapshot,
+            uint256 snapshotSupply,
+            uint256 withdrawn,
+            uint256 pauseTime
+        )
     {
         active = emergencyStorage.emergencyMode;
         snapshot = emergencyStorage.emergencySnapshot;
+        snapshotSupply = emergencyStorage.emergencySnapshotSupply;
         withdrawn = emergencyStorage.emergencyTotalWithdrawn;
         pauseTime = emergencyStorage.pauseTimestamp;
     }
@@ -455,27 +472,19 @@ contract SafeHedgeFundVault is
             queueIdx,
             navPerShare(),
             _normalize,
-            _denormalize,
-            _accrueEntranceFee
+            _previewEntranceFee,
+            _recordEntranceFee
         );
 
+        // processSingleDeposit now treats shares == 0 as a failure (B-HIGH-5),
+        // so on the ok=true branch we always have shares > 0 and the queue
+        // item's mint+deploy is safe to do here.
         if (ok) {
-            if (shares == 0) {
-                emit DepositAutoProcessFailed(
-                    queueStorage.depositQueue[queueIdx].user,
-                    queueStorage.depositQueue[queueIdx].amount,
-                    "zero shares calculated"
-                );
-                return;
-            }
-
             address user = queueStorage.depositQueue[queueIdx].user;
             uint256 amount = queueStorage.depositQueue[queueIdx].amount;
 
             _mint(user, shares);
-
             baseToken.safeTransfer(safeWallet, netNative);
-
             emit Deposited(user, amount, shares);
         } else {
             emit DepositAutoProcessFailed(
@@ -500,12 +509,23 @@ contract SafeHedgeFundVault is
         emit Deposited(user, originalAmount, shares);
     }
 
+    /// @dev Pays a redemption out of the Safe via the module. Pure preview
+    /// up to the Safe call; only commits the exit fee to the ledger after
+    /// the user balance is verified to have grown by `netAmount`. This
+    /// matters because:
+    ///   - retried failed payouts must NOT keep adding to the fee ledger
+    ///     (B-CRIT-1)
+    ///   - the previous Safe→vault fee bounce-back transfer was both dead
+    ///     code (encoded a normalized amount as native, transfer always
+    ///     reverted) and would have double-counted on success (B-HIGH-4).
+    ///     Exit fee value already lives at the Safe — payoutAccruedFees
+    ///     pulls it back via the same module path when the admin calls.
     function _payout(address user, uint256 shares, uint256 nav)
         internal
         returns (bool success, uint256 netAmount)
     {
         uint256 gross = (shares * nav) / 1e18;
-        (uint256 net, uint256 feeNative) = feeStorage.accrueExitFee(gross);
+        (uint256 net, uint256 feeNormalized) = feeStorage.previewExitFee(gross);
         netAmount = _denormalize(net);
 
         uint256 userBalBefore = baseToken.balanceOf(user);
@@ -523,22 +543,13 @@ contract SafeHedgeFundVault is
             success = (userBalAfter >= userBalBefore + netAmount);
         }
 
-        if (success && feeNative > 0) {
-            bytes memory feeData = abi.encodeWithSelector(IERC20.transfer.selector, address(this), feeNative);
-            (bool feeOk, ) = safeWallet.call(
-                abi.encodeWithSignature(
-                    "execTransactionFromModule(address,uint256,bytes,uint8)",
-                    address(baseToken), 0, feeData, 0
-                )
-            );
-            if (feeOk) {
-                feeStorage.accruedExitFees += feeNative;
-            }
+        if (success && feeNormalized > 0) {
+            feeStorage.recordExitFee(feeNormalized);
         }
     }
 
     function _emergencyPayout(address user, uint256 amount) internal {
-        EmergencyManager.executePayout(baseToken, user, amount, safeWallet, isModuleEnabled);
+        EmergencyManager.executePayout(baseToken, user, amount);
     }
 
     function _transferBack(address user, uint256 amount) internal {
@@ -565,8 +576,12 @@ contract SafeHedgeFundVault is
         return maxBatchSize;
     }
 
-    function _accrueEntranceFee(uint256 amount) internal returns (uint256, uint256) {
-        return feeStorage.accrueEntranceFee(amount);
+    function _previewEntranceFee(uint256 amount) internal view returns (uint256, uint256) {
+        return feeStorage.previewEntranceFee(amount);
+    }
+
+    function _recordEntranceFee(uint256 feeNative) internal {
+        feeStorage.recordEntranceFee(feeNative);
     }
 
     function _emitDeposited(address user, uint256 amount, uint256 shares) internal {

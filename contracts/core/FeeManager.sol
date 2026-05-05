@@ -210,60 +210,85 @@ library FeeManager {
         }
     }
 
+    // ── Fee preview/record split ────────────────────────────────────────
+    //
+    // Why two functions instead of one mutating "accrue":
+    //
+    // The previous design had a single mutating accrueEntranceFee/accrueExitFee
+    // that the caller invoked BEFORE the slippage / zero-shares / Safe-call
+    // success checks. If those checks failed, the function returned without
+    // marking the queue item processed — but the fee was already on the
+    // ledger. On retry, the same item would accrue the fee again. For the
+    // exit fee path it was even worse: redeem() called accrueExitFee at the
+    // top, and _payout called it AGAIN when the actual transfer happened, so
+    // every redemption was billed at minimum 2× and up to (1+N)× under
+    // retries (B-CRIT-1, B-CRIT-2 in docs/AUDIT_REPORT.md).
+    //
+    // Splitting into a pure preview + a post-success record lets callers
+    // size the slippage check and the share calculation off the same numbers
+    // the user sees, then commit the fee to the ledger exactly once, only
+    // after the operation is irreversibly successful.
+
     /**
-     * @notice Accrues entrance fee on deposit
-     * @dev Called during deposit processing. Fee is deducted from deposit amount.
-     *
-     * WHY IT'S IMPORTANT:
-     * - Compensates fund for costs of deploying new capital
-     * - Discourages short-term trading (anti-gaming mechanism)
-     * - Returns net amount for share calculation
-     *
+     * @notice Pure preview of an entrance fee. Does NOT mutate state.
      * @param fs Fee storage reference
-     * @param depositAmount Total amount being deposited (native decimals)
-     * @return netAmount Amount after fee deduction for share minting
-     * @return feeNative Fee amount in native decimals (kept in vault)
+     * @param depositAmount Deposit amount in native decimals
+     * @return netAmount Native decimals after fee
+     * @return feeNative Fee in native decimals (caller passes this to recordEntranceFee on success)
      */
-    function accrueEntranceFee(
+    function previewEntranceFee(
         FeeStorage storage fs,
         uint256 depositAmount
-    ) external returns (uint256 netAmount, uint256 feeNative) {
-        uint256 fee = (depositAmount * fs.entranceFeeBps) / FEE_DENOMINATOR;
-        netAmount = depositAmount - fee;
-        feeNative = fee;
+    ) external view returns (uint256 netAmount, uint256 feeNative) {
+        feeNative = (depositAmount * fs.entranceFeeBps) / FEE_DENOMINATOR;
+        netAmount = depositAmount - feeNative;
+    }
 
-        if (fee > 0) {
-            uint256 feeNormalized = fee * fs.decimalFactor;
+    /**
+     * @notice Commits a previously-previewed entrance fee to the ledger.
+     * @dev Caller MUST have validated the operation will succeed before
+     *      calling this. Idempotency is the caller's responsibility.
+     * @param fs Fee storage reference
+     * @param feeNative Fee amount in native decimals (from previewEntranceFee)
+     */
+    function recordEntranceFee(
+        FeeStorage storage fs,
+        uint256 feeNative
+    ) external {
+        if (feeNative > 0) {
+            uint256 feeNormalized = feeNative * fs.decimalFactor;
             fs.accruedEntranceFees += feeNormalized;
             emit FeesAccrued(0, 0, feeNormalized, 0);
         }
     }
 
     /**
-     * @notice Accrues exit fee on redemption
-     * @dev Called during redemption processing. Fee is deducted from redemption value.
-     *
-     * WHY IT'S IMPORTANT:
-     * - Compensates fund for costs of liquidating positions
-     * - Protects remaining shareholders from dilution
-     * - Discourages short-term trading
-     *
+     * @notice Pure preview of an exit fee. Does NOT mutate state.
      * @param fs Fee storage reference
-     * @param grossAmount Gross redemption value (18 decimals)
-     * @return netAmount Net value after fee deduction
-     * @return feeNative Fee amount (18 decimals, will be kept in vault)
+     * @param grossAmount Gross redemption value in 18-decimal normalized form
+     * @return netAmount Net normalized amount after fee
+     * @return feeNormalized Fee in 18-dec normalized form (pass to recordExitFee on success)
      */
-    function accrueExitFee(
+    function previewExitFee(
         FeeStorage storage fs,
         uint256 grossAmount
-    ) external returns (uint256 netAmount, uint256 feeNative) {
-        uint256 fee = (grossAmount * fs.exitFeeBps) / FEE_DENOMINATOR;
-        netAmount = grossAmount - fee;
-        feeNative = fee;
+    ) external view returns (uint256 netAmount, uint256 feeNormalized) {
+        feeNormalized = (grossAmount * fs.exitFeeBps) / FEE_DENOMINATOR;
+        netAmount = grossAmount - feeNormalized;
+    }
 
-        if (fee > 0) {
-            fs.accruedExitFees += fee;
-            emit FeesAccrued(0, 0, 0, fee);
+    /**
+     * @notice Commits a previously-previewed exit fee to the ledger.
+     * @param fs Fee storage reference
+     * @param feeNormalized Fee in 18-dec normalized form (from previewExitFee)
+     */
+    function recordExitFee(
+        FeeStorage storage fs,
+        uint256 feeNormalized
+    ) external {
+        if (feeNormalized > 0) {
+            fs.accruedExitFees += feeNormalized;
+            emit FeesAccrued(0, 0, 0, feeNormalized);
         }
     }
 
