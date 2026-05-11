@@ -47,7 +47,7 @@ export default function UserDashboard() {
   }
 
   const userShares = position.data?.[0] ?? 0n
-  const userValue = (userShares * (navPerShare.data ?? 1n)) / BigInt(1e18)
+  const userValue = position.data?.[1] ?? 0n // USDC native (6-dec)
 
   return (
     <>
@@ -97,21 +97,21 @@ export default function UserDashboard() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <StatsCard
               title="NAV Per Share"
-              value={formatUSD(navPerShare.data, 18)}
+              value={formatUSD(navPerShare.data, 30)}
               subtitle="Current share value"
               icon={TrendingUp}
               loading={navPerShare.isLoading}
             />
             <StatsCard
               title="Total AUM"
-              value={formatUSD(totalAum.data, 18)}
+              value={formatUSD(totalAum.data, 6)}
               subtitle="Assets under management"
               icon={DollarSign}
               loading={totalAum.isLoading}
             />
             <StatsCard
               title="Your Position"
-              value={formatUSD(userValue, 18)}
+              value={formatUSD(userValue, 6)}
               subtitle={`${formatToken(userShares, 18)} shares`}
               icon={Wallet}
               loading={position.isLoading}

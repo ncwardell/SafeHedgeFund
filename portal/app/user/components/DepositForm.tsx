@@ -2,12 +2,10 @@
 
 import { useState } from 'react'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi'
-import { VAULT_ADDRESS, ERC20_ABI } from '@/lib/contracts'
+import { VAULT_ADDRESS, USDC_ADDRESS, ERC20_ABI } from '@/lib/contracts'
 import { useDeposit } from '@/hooks/useVault'
 import { parseTokenInput, calculateSlippage, formatToken } from '@/lib/utils'
 import { TrendingUp, Loader2, CheckCircle, XCircle } from 'lucide-react'
-
-const BASE_TOKEN = process.env.NEXT_PUBLIC_BASE_TOKEN as `0x${string}` || '0x0000000000000000000000000000000000000000'
 
 export function DepositForm() {
   const { address } = useAccount()
@@ -16,26 +14,26 @@ export function DepositForm() {
 
   // Get token info
   const { data: tokenBalance } = useReadContract({
-    address: BASE_TOKEN,
+    address: USDC_ADDRESS,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
   })
 
   const { data: tokenSymbol } = useReadContract({
-    address: BASE_TOKEN,
+    address: USDC_ADDRESS,
     abi: ERC20_ABI,
     functionName: 'symbol',
   })
 
   const { data: decimals } = useReadContract({
-    address: BASE_TOKEN,
+    address: USDC_ADDRESS,
     abi: ERC20_ABI,
     functionName: 'decimals',
   })
 
   const { data: allowance, refetch: refetchAllowance } = useReadContract({
-    address: BASE_TOKEN,
+    address: USDC_ADDRESS,
     abi: ERC20_ABI,
     functionName: 'allowance',
     args: address ? [address, VAULT_ADDRESS] : undefined,
@@ -57,7 +55,7 @@ export function DepositForm() {
   const handleApprove = async () => {
     const parsedAmount = parseTokenInput(amount, decimals ?? 18)
     approve({
-      address: BASE_TOKEN,
+      address: USDC_ADDRESS,
       abi: ERC20_ABI,
       functionName: 'approve',
       args: [VAULT_ADDRESS, parsedAmount],

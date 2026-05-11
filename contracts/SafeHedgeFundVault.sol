@@ -157,6 +157,14 @@ contract SafeHedgeFundVault is
 
         feeStorage.decimalFactor = DECIMAL_FACTOR;
 
+        // Lending pool defaults. Set in constructor (rather than via the
+        // 3-day timelocked ConfigManager flow) so a freshly-deployed
+        // vault has working lending parameters from block 1. Subsequent
+        // changes go through the timelocked propose/execute flow.
+        swapFeeBps = 30;       // 0.30%
+        lltvBps = 5000;        // 50%
+        borrowRateBps = 800;   // 8% APR
+
         emit Initialized(block.timestamp);
     }
 

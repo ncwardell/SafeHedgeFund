@@ -33,7 +33,8 @@ export default function AumUpdaterDashboard() {
   const [newAum, setNewAum] = useState('')
 
   const handleUpdateAum = () => {
-    const parsedAum = parseTokenInput(newAum, 18)
+    // AUM is in USDC native decimals (6) — input is human-readable USDC.
+    const parsedAum = parseTokenInput(newAum, 6)
     updateAum.updateAum(parsedAum)
     setNewAum('')
   }
@@ -76,10 +77,15 @@ export default function AumUpdaterDashboard() {
     )
   }
 
+  // HWM tuple: (hwm, lowestNav, recoveryStart, daysToReset).
+  // hwm/lowestNav are in NAV units (30-dec). recoveryStart is a unix timestamp,
+  // daysToReset is a day count (0 outside drawdown).
   const currentHWM = hwmStatus.data?.[0] ?? 0n
-  const currentNav = hwmStatus.data?.[1] ?? 0n
-  const inDrawdown = hwmStatus.data?.[2] ?? false
-  const inRecovery = hwmStatus.data?.[3] ?? false
+  const lowestNavInDrawdown = hwmStatus.data?.[1] ?? 0n
+  const recoveryStart = hwmStatus.data?.[2] ?? 0n
+  const daysToReset = hwmStatus.data?.[3] ?? 0n
+  const inDrawdown = lowestNavInDrawdown > 0n && recoveryStart === 0n
+  const inRecovery = recoveryStart > 0n && daysToReset > 0n
 
   return (
     <>
@@ -100,21 +106,21 @@ export default function AumUpdaterDashboard() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
             <StatsCard
               title="Current AUM"
-              value={formatUSD(totalAum.data, 18)}
+              value={formatUSD(totalAum.data, 6)}
               subtitle="Total assets under management"
               icon={DollarSign}
               loading={totalAum.isLoading}
             />
             <StatsCard
               title="NAV Per Share"
-              value={formatUSD(navPerShare.data, 18)}
+              value={formatUSD(navPerShare.data, 30)}
               subtitle="Current share price"
               icon={TrendingUp}
               loading={navPerShare.isLoading}
             />
             <StatsCard
               title="High Water Mark"
-              value={formatUSD(currentHWM, 18)}
+              value={formatUSD(currentHWM, 30)}
               subtitle={inDrawdown ? 'In Drawdown' : inRecovery ? 'In Recovery' : 'Active'}
               icon={Activity}
               loading={hwmStatus.isLoading}
@@ -173,7 +179,7 @@ export default function AumUpdaterDashboard() {
                   className="input-field"
                 />
                 <p className="mt-2 text-sm text-gray-500 dark:text-gray-400">
-                  Current AUM: {formatToken(totalAum.data, 18, 2)} tokens
+                  Current AUM: {formatToken(totalAum.data, 6, 2)} USDC
                 </p>
               </div>
 

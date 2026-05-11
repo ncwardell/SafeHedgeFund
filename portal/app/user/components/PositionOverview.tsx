@@ -2,8 +2,8 @@
 
 import { useAccount } from 'wagmi'
 import { useUserPosition } from '@/hooks/useVault'
-import { formatToken } from '@/lib/utils'
-import { Clock, CheckCircle } from 'lucide-react'
+import { formatToken, formatUSD } from '@/lib/utils'
+import { Clock, CheckCircle, DollarSign } from 'lucide-react'
 
 export function PositionOverview() {
   const { address } = useAccount()
@@ -23,8 +23,9 @@ export function PositionOverview() {
   }
 
   const shares = position.data?.[0] ?? 0n
-  const pendingDeposits = position.data?.[1] ?? 0n
-  const pendingRedemptions = position.data?.[2] ?? 0n
+  const value = position.data?.[1] ?? 0n
+  const pendingDeposits = position.data?.[2] ?? 0n
+  const pendingRedemptions = position.data?.[3] ?? 0n
 
   const hasPendingTransactions = pendingDeposits > 0n || pendingRedemptions > 0n
 
@@ -47,18 +48,28 @@ export function PositionOverview() {
 
         <div className="flex justify-between items-center py-3 border-b border-gray-200 dark:border-gray-700">
           <div className="flex items-center space-x-2">
-            <Clock className="h-5 w-5 text-yellow-600" />
-            <span className="text-gray-700 dark:text-gray-300">Pending Deposits</span>
+            <DollarSign className="h-5 w-5 text-green-600" />
+            <span className="text-gray-700 dark:text-gray-300">Position Value</span>
           </div>
           <span className="text-lg font-semibold text-gray-900 dark:text-white">
-            {formatToken(pendingDeposits, 18)}
+            {formatUSD(value, 6)}
+          </span>
+        </div>
+
+        <div className="flex justify-between items-center py-3 border-b border-gray-200 dark:border-gray-700">
+          <div className="flex items-center space-x-2">
+            <Clock className="h-5 w-5 text-yellow-600" />
+            <span className="text-gray-700 dark:text-gray-300">Pending Deposits (USDC)</span>
+          </div>
+          <span className="text-lg font-semibold text-gray-900 dark:text-white">
+            {formatToken(pendingDeposits, 6)}
           </span>
         </div>
 
         <div className="flex justify-between items-center py-3">
           <div className="flex items-center space-x-2">
             <Clock className="h-5 w-5 text-yellow-600" />
-            <span className="text-gray-700 dark:text-gray-300">Pending Redemptions</span>
+            <span className="text-gray-700 dark:text-gray-300">Pending Redemptions (HFS)</span>
           </div>
           <span className="text-lg font-semibold text-gray-900 dark:text-white">
             {formatToken(pendingRedemptions, 18)}

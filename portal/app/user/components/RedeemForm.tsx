@@ -18,15 +18,18 @@ export function RedeemForm() {
   const userShares = position.data?.[0] ?? 0n
   const nav = navPerShare.data ?? 0n
 
+  // navPerShare is 18-dec normalized × 1e18 (i.e. 30-dec scaled).
+  // shares (18-dec) * nav / 1e18 / 1e12 = USDC native (6-dec).
+  const NORMALIZE_USDC = 10n ** 12n // 18 - 6
+  const parsedShares = parseTokenInput(shares, 18)
+  const estimatedAmount =
+    nav > 0n ? (parsedShares * nav) / BigInt(1e18) / NORMALIZE_USDC : 0n
+
   const handleRedeem = async () => {
-    const parsedShares = parseTokenInput(shares, 18)
-    const estimatedAmount = (parsedShares * nav) / BigInt(1e18)
+    // minAmountOut is in USDC native — match what the contract pays out.
     const minAmountOut = calculateSlippage(estimatedAmount, parseFloat(slippage) * 100)
     redeem.redeem(parsedShares, minAmountOut)
   }
-
-  const parsedShares = parseTokenInput(shares, 18)
-  const estimatedAmount = (parsedShares * nav) / BigInt(1e18)
 
   return (
     <div className="card">
@@ -88,7 +91,7 @@ export function RedeemForm() {
               Estimated amount
             </p>
             <p className="text-lg font-semibold text-gray-900 dark:text-white">
-              {formatToken(estimatedAmount, 18)} tokens
+              {formatToken(estimatedAmount, 6)} USDC
             </p>
           </div>
         )}
