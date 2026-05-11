@@ -135,7 +135,7 @@ export default function Home() {
                   Total AUM
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white">
-                  {formatUSD(totalAum.data, 18)}
+                  {formatUSD(totalAum.data, 6)}
                 </p>
               </div>
               <div className="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 border border-gray-200 dark:border-gray-700">
@@ -143,7 +143,7 @@ export default function Home() {
                   NAV Per Share
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white">
-                  {formatUSD(navPerShare.data, 18)}
+                  {formatUSD(navPerShare.data, 30)}
                 </p>
               </div>
             </div>

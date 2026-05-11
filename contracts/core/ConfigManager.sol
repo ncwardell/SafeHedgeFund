@@ -39,6 +39,12 @@ library ConfigManager {
     uint256 public constant MAX_HWM_RECOVERY_PCT = 10_000;
     uint256 public constant MIN_HWM_RECOVERY_PERIOD = 1 days;
 
+    // Lending pool config bounds
+    uint256 public constant MAX_SWAP_FEE = 100;          // 1%
+    uint256 public constant MIN_LLTV = 1_000;            // 10%
+    uint256 public constant MAX_LLTV = 9_000;            // 90%
+    uint256 public constant MAX_BORROW_RATE = 5_000;     // 50% APR
+
     /**
      * @notice Represents a pending configuration change proposal
      * @dev Proposals are identified by hash of (key, value) pair
@@ -82,6 +88,9 @@ library ConfigManager {
     bytes32 internal constant HWM_DRAWDOWN_PCT_KEY = keccak256("hwmDrawdownPct");
     bytes32 internal constant HWM_RECOVERY_PCT_KEY = keccak256("hwmRecoveryPct");
     bytes32 internal constant HWM_RECOVERY_PERIOD_KEY = keccak256("hwmRecoveryPeriod");
+    bytes32 internal constant SWAP_FEE_KEY = keccak256("swapFeeBps");
+    bytes32 internal constant LLTV_KEY = keccak256("lltvBps");
+    bytes32 internal constant BORROW_RATE_KEY = keccak256("borrowRateBps");
 
     error CooldownActive();
     error ProposalExists();
@@ -342,6 +351,9 @@ library ConfigManager {
         if (keyHash == HWM_DRAWDOWN_PCT_KEY && value > MAX_HWM_DRAWDOWN) revert ValueTooHigh();
         if (keyHash == HWM_RECOVERY_PCT_KEY && value > MAX_HWM_RECOVERY_PCT) revert ValueTooHigh();
         if (keyHash == HWM_RECOVERY_PERIOD_KEY && value < MIN_HWM_RECOVERY_PERIOD) revert ValueTooLow();
+        if (keyHash == SWAP_FEE_KEY && value > MAX_SWAP_FEE) revert ValueTooHigh();
+        if (keyHash == LLTV_KEY && (value < MIN_LLTV || value > MAX_LLTV)) revert ValueTooHigh();
+        if (keyHash == BORROW_RATE_KEY && value > MAX_BORROW_RATE) revert ValueTooHigh();
     }
 
     /**
@@ -363,7 +375,8 @@ library ConfigManager {
             h == MGMT_KEY || h == PERF_KEY || h == ENTRANCE_KEY || h == EXIT_KEY ||
             h == FEE_RECIPIENT_KEY || h == MIN_DEPOSIT_KEY || h == MIN_REDEMPTION_KEY ||
             h == TARGET_LIQUIDITY_KEY || h == MAX_AUM_AGE_KEY || h == MAX_BATCH_SIZE_KEY ||
-            h == HWM_DRAWDOWN_PCT_KEY || h == HWM_RECOVERY_PCT_KEY || h == HWM_RECOVERY_PERIOD_KEY
+            h == HWM_DRAWDOWN_PCT_KEY || h == HWM_RECOVERY_PCT_KEY || h == HWM_RECOVERY_PERIOD_KEY ||
+            h == SWAP_FEE_KEY || h == LLTV_KEY || h == BORROW_RATE_KEY
         ) {
             return h;
         }

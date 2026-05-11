@@ -1,452 +1,400 @@
-# Smart Contract Audit Report - SafeHedgeFund
-**Date:** 2025-10-30
-**Auditor:** Claude Code
-**Contracts Audited:** SafeHedgeFundVault.sol, QueueManager.sol, FeeManager.sol, EmergencyManager.sol, ConfigManager.sol, AUMManager.sol
+# SafeHedgeFund Audit Report
+
+**Branches reviewed:** `claude/fix-critical-bugs` (vault) + `claude/shared-pool` (lending)
+**Reviewer:** Claude (Opus 4.7)
+**Scope:** `contracts/SafeHedgeFundVault.sol`, `contracts/core/*`, `contracts/lending/SharedPool.sol`
+**Out of scope:** `portal/` reviewed only for ABI surface. (`ICP/` removed from repo.)
 
 ---
 
-## Executive Summary
+## 0. Security model — what is Gnosis Safe actually protecting?
 
-This audit identified **6 CRITICAL**, **3 HIGH**, and **5 MEDIUM** severity issues in the SafeHedgeFund smart contract system. Immediate attention is required for the critical issues, particularly the infinite recursion bug and decimal handling problems.
+The Safe is a great primitive for the *off-chain* threat model: stolen keys, rogue insiders, nation-state coercion. But the Safe protects funds only when the smart-contract module attached to it can't be tricked into asking the Safe for the wrong thing.
 
----
+This vault *is* a Safe module. Every successful exploit of this contract becomes a clean call to the Safe via `execTransactionFromModule` — at which point the Safe sees a properly authenticated request from a known module and signs it off. Multisig signers don't get a second chance to review.
 
-## CRITICAL SEVERITY ISSUES
+So the relevant questions for this audit are:
 
-### CRITICAL-1: Infinite Recursion in `_burn()` Wrapper Function
-**Location:** `SafeHedgeFundVault.sol:635-637`
-**Severity:** CRITICAL
+1. **Can a caller construct an arbitrary module call?** No. The three call sites (`_payout`, `EmergencyManager.executePayout`, `FeeManager._executeFeePayout`) all hardcode the target as `address(baseToken)` (immutable), the operation as `Call` (not DelegateCall), and the data as `IERC20.transfer(<bounded recipient>, amount)` where the recipient comes from `msg.sender` or a queue item, never from arbitrary calldata. Verified by hand against the three sources.
 
-**Description:**
-```solidity
-function _burn(address user, uint256 shares) internal {
-    _burn(user, shares);  // ❌ Calls itself infinitely
-}
-```
+2. **Can a caller cause the contract to ask for too much?** This is where the real bugs lived. Pre-fix, the redeem path overcharged exit fees by 2× to N× (B-CRIT-1) and the deposit path leaked entrance fees on every retry of a failing item (B-CRIT-2). Both have been fixed via a preview/record split in FeeManager.
 
-The internal `_burn` wrapper function calls itself recursively instead of calling the parent ERC20's `_burn` function. This will cause a stack overflow and transaction failure whenever burning is attempted.
+3. **Can role compromise hurt users?** Partially. AUM_UPDATER is explicitly trusted (design choice §1) — a compromised key can manipulate NAV within `[onChainLiquidity, ∞]`. ADMIN_ROLE controls config (rate-limited by 3-day timelock + 5-day cooldown), pause, and rescue. GUARDIAN_ROLE can trigger emergency mode (which, post-B-HIGH-3 fix, no longer depends on the Safe being reachable).
 
-**Impact:**
-- **All redemptions will fail** (line 256 calls `_burn`)
-- **All emergency withdrawals will fail** (line 122 in EmergencyManager calls burn callback)
-- **All cancellations will fail** (QueueManager cancellations rely on this)
-- **Contract is completely broken for any withdraw functionality**
+4. **Can the Safe being unreachable brick user funds?** Pre-fix yes — the emergency path went through the module. Post-B-HIGH-3 emergencyWithdraw pays only from the vault's own balance, so a manager who disables the module can't trap users behind a non-functional crisis path.
 
-**Recommended Fix:**
-```solidity
-function _burn(address user, uint256 shares) internal {
-    super._burn(user, shares);  // Call parent ERC20._burn
-}
-```
+5. **Reentrancy on the module call?** All entry points that hit `_payout` (`redeem`, `processRedemptionQueue`) carry `nonReentrant`. The user-side recipient cannot re-enter the vault during the Safe-mediated transfer.
 
-**OR** remove this wrapper entirely and call `super._burn` directly where needed.
+The remaining open findings (`B-MED-*`, `B-LOW-*`) are correctness, ergonomics, and dead-code issues — none of them give a caller a way to extract more than their fair share or interfere with another user's withdrawal. The criticals and the user-facing high-severity issues are all fixed on this branch.
 
 ---
 
-### CRITICAL-2: Hardcoded Decimal Offset Breaks Multi-Token Support
-**Location:** `FeeManager.sol:346-352, 153, 207`
-**Severity:** CRITICAL
+## 1. State of the code — what's been fixed in this branch
 
-**Description:**
-```solidity
-function _getDecimalOffset() internal pure returns (uint8) {
-    // For now, assume standard 6 decimal tokens (USDC/USDT) - offset of 12
-    return 12;  // ❌ Hardcoded assumption
-}
-```
+| Finding | Severity | State | Commit |
+|---|---|---|---|
+| B1 — batch deposit head-pointer drift | Critical | **Fixed** | `36b5798` |
+| B2 — OZ v4 imports | Critical (build) | **Fixed** | `36b5798` |
+| B18 — navPerShare mixed-unit subtraction | Critical | **Fixed** | `36b5798` |
+| B10 — frontend ABI mismatches | High | **Fixed** | `ee96921` |
+| B-CRIT-1 — exit fee accrued 2×–N× per redeem | Critical | **Fixed** | this PR |
+| B-CRIT-2 — entrance fee leaks on failed processings | Critical | **Fixed** | this PR |
+| B-CRIT-3 — emergencyWithdraw uses live totalSupply (newly found) | Critical | **Fixed** | this PR |
+| B-HIGH-2 — cancellation gas bomb | High | **Fixed** | this PR |
+| B-HIGH-3 — emergency depends on Safe access | High | **Fixed** | this PR |
+| B-HIGH-4 — `_payout` fee transfer encodes wrong amount | High | **Fixed** (deleted) | this PR |
+| B-HIGH-5 — auto-process zero-shares strand | High | **Fixed** | this PR |
+| B-HIGH-1 (audit residue) — entitlement vs payout in emergency | — | **Withdrawn**: math review showed `+= entitlement` is the correct accounting. See §3 for the analysis. |
+| B-MED-1 — perf fee charged on pre-fee NAV, HWM updated to post-fee NAV | Medium | **Fixed** (cleanup PR) |
+| B-MED-3 — pauseTimestamp not cleared on unpause | Medium | **Fixed** (cleanup PR) |
+| B-LOW-5 — round-trip rounding loss at exact minDeposit (non-18-dec) | Low | **Fixed** (cleanup PR) |
 
-The FeeManager library hardcodes a decimal offset of 12, assuming all base tokens have 6 decimals. However, the vault constructor accepts tokens with up to 18 decimals.
-
-**Impact:**
-- **Fee calculations will be catastrophically wrong** for non-6-decimal tokens
-- For 18-decimal tokens (DAI, WETH): fees will be 1 trillion times too large
-- For 8-decimal tokens (WBTC): fees will be 10,000 times too large
-- **Complete loss of funds or contract bricking**
-
-**Locations Affected:**
-1. Line 153: `accrueEntranceFee` - entrance fees calculated incorrectly
-2. Line 207: `payoutFees` - fee payouts calculated incorrectly
-
-**Recommended Fix:**
-Pass the `DECIMAL_FACTOR` or `baseDecimals` from the vault to the FeeManager functions, or refactor to use the function pointers for normalization instead of manual calculation.
+Open findings (correctness/ergonomics, none escalating to fund loss): B-MED-2, B-MED-4, B-LOW-1 through B-LOW-4. See §5.
 
 ---
 
-### CRITICAL-3: Shares Burned Before Redemption Queuing
-**Location:** `SafeHedgeFundVault.sol:256-268`
-**Severity:** CRITICAL
+## 2. Design choices (NOT findings)
 
-**Description:**
-```solidity
-// Burn shares first (state change before external calls)
-_burn(msg.sender, shares);  // Line 256
+These are explicit policy decisions, called out so they don't get re-flagged in future re-reviews.
 
-if (autoPayoutRedemptions) {
-    (bool ok, uint256 paid) = _payout(msg.sender, shares, nav);
-    if (ok) {
-        emit Redeemed(msg.sender, shares, paid);
-        return;  // ✓ Success, shares burned correctly
-    } else {
-        emit RedemptionAutoPayoutFailed(msg.sender, shares, "Safe payout failed");
-    }
-}
-
-queueStorage.queueRedemption(msg.sender, shares, nav, minAmountOut);  // Line 268
-```
-
-**Issue:** Shares are burned at line 256, but if `queueRedemption` at line 268 fails (e.g., queue full, user limit exceeded), the transaction reverts BUT if there's any issue with how the queue handles the already-burned shares, users lose their shares without getting queued for redemption.
-
-**Impact:**
-- If `queueRedemption` reverts, shares are already burned in the current transaction (which will revert)
-- However, if there's a non-reverting failure path in queue logic, shares could be lost
-- Currently mitigated by revert behavior, but risky pattern
-
-**Recommended Fix:**
-Only burn shares after successful queueing:
-```solidity
-if (autoPayoutRedemptions) {
-    (bool ok, uint256 paid) = _payout(msg.sender, shares, nav);
-    if (ok) {
-        _burn(msg.sender, shares);
-        emit Redeemed(msg.sender, shares, paid);
-        return;
-    }
-}
-
-_burn(msg.sender, shares);
-queueStorage.queueRedemption(msg.sender, shares, nav, minAmountOut);
-```
+| Decision | Where | Rationale |
+|---|---|---|
+| **AUM updater is trusted** — `newAum` validated only against on-chain lower bound | `FeeManager.sol:139-140` | Hedge fund needs to deploy off-chain; tight upper bound rejects legitimate growth. Mitigated by multi-sig keeper key, monitoring, emergency path |
+| **Mgmt fees skipped if AUM update gap > 3 days** | `FeeManager.sol:197` | Avoids huge fee spike after extended downtime; manager forfeits fees as the cost of an outage |
+| **Single base token only** | constructor | Multi-asset accounting is its own project; off-chain venues handle conversions |
+| **HWM reset mechanic** (drawdown threshold + recovery window) | `FeeManager.sol:507-541` | Allows recovery from drawdowns without double-paying performance fees on the same gain band |
+| **Non-upgradeable** | architectural | Users see the exact code they trust; "upgrade" = deploy v2, emergency-out of v1 |
+| **30-day automatic emergency thresholds** | `EmergencyManager.sol:43` | Long enough to avoid false trips during holidays/long outages, short enough to protect users |
+| **5 pending requests/user, 1000 queue cap** | `QueueManager.sol:6-7` | DOS prevention |
+| **Deposit shares computed at process time, not queue time** | `QueueManager.sol:170` | Fairness: user gets the realized NAV, not a predicted one. Slippage protected by `minShares` |
 
 ---
 
-### CRITICAL-4: Integer Overflow Check Placed After Increment
-**Location:** `QueueManager.sol:86-87, 117-118`
-**Severity:** CRITICAL
+## 3. Why B-HIGH-1 was withdrawn (and what was actually wrong)
 
-**Description:**
-```solidity
-// Fixed MEDIUM #8: Added overflow protection
-// While unlikely to overflow, adding check for safety
-if (qs.depositQueueTail == type(uint256).max) revert QueueOverflow();
-qs.depositQueueTail++;  // ❌ Check is AFTER the increment would overflow
-```
+The original audit flagged `es.emergencyTotalWithdrawn += entitlement` as a bug, claiming late withdrawers would receive less than their fair share if early withdrawers got partial payouts. I initially "fixed" this by tracking `+= payoutAmount` — until writing the regression test surfaced that the *original* code was algorithmically correct.
 
-The overflow check happens at line 86, but the increment happens at line 87. If `depositQueueTail` is `type(uint256).max - 1`, it will increment to `max`, pass the check, then the NEXT call will increment from `max` to `0` (overflow), bypassing the check entirely.
+The pro-rata invariant the algorithm wants to maintain is: every user gets the same fraction of their entitlement, where the fraction = `available_at_their_turn / remainingClaims_at_their_turn`. For that ratio to stay constant across sequential calls:
 
-**Even worse:** If `depositQueueTail` equals `type(uint256).max`, the check at line 86 will revert, but this is BEFORE the increment. On the NEXT call, `depositQueueTail` would overflow.
+- After each call: `available -= entitlement * scale` and `remainingClaims -= entitlement`
+- New scale = `(avail - e*s) / (claims - e)` = `(avail - (avail/claims)*e) / (claims - e)` = `avail/claims` ✓
 
-**Impact:**
-- Queue tail wraps to 0, corrupting queue indices
-- Queue head and tail comparison becomes invalid
-- Deposit/redemption queue completely breaks
-- Funds can be lost or double-spent
+Tracking `+= entitlement` keeps `remainingClaims` = "sum of entitlements not yet claimed". Tracking `+= payoutAmount` instead would make `remainingClaims` shrink slower than `available`, which actually makes scale *decrease* for late withdrawers and strand liquidity in the vault.
 
-**Recommended Fix:**
-```solidity
-if (qs.depositQueueTail >= type(uint256).max) revert QueueOverflow();
-qs.depositQueueTail++;
-```
+**The real bug** the test exposed was elsewhere: `emergencyWithdraw` divided entitlement by `totalSupply()` (live), but each withdrawal burns shares, so subsequent users computed entitlement against a smaller denominator and over-claimed. Architecture doc actually said the supply was supposed to be snapshotted — it just wasn't. That's now B-CRIT-3 below, and it's fixed.
 
-**Better Fix:** Since this is Solidity 0.8.24, overflow is impossible (will revert automatically). Remove the manual check entirely or add a practical limit:
-```solidity
-if (qs.depositQueueTail >= type(uint256).max - 1000) revert QueueOverflow();
-qs.depositQueueTail++;
-```
+Lesson: write the test first. The audit chain-of-reasoning was internally consistent but didn't survive contact with executable math.
 
 ---
 
-### CRITICAL-5: AUM Tracking Divergence
-**Location:** `SafeHedgeFundVault.sol:701-705`
-**Severity:** CRITICAL
+## 4. New finding: B-CRIT-3 — emergency divides by live totalSupply
 
-**Description:**
-The contract has two different AUM calculation methods:
-1. **Official AUM**: `feeStorage.aum` - updated by `updateAum()` (line 275-286)
-2. **Calculated AUM**: `getTotalAum()` - calculated from token balances (line 702-704)
+**File:** `EmergencyManager.sol:emergencyWithdraw` (pre-fix), `SafeHedgeFundVault.sol:emergencyWithdraw` (caller)
+**Severity:** Critical (breaks pro-rata fairness once any user withdraws)
+**Status:** **Fixed in this PR**
+
+Pre-fix:
 
 ```solidity
-function getTotalAum() public view returns (uint256) {
-    uint256 onChain = baseToken.balanceOf(safeWallet) + baseToken.balanceOf(address(this));
-    uint256 fees = _denormalize(feeStorage.totalAccruedFees());
-    return onChain >= fees ? onChain - fees : 0;
-}
+uint256 entitlement = (shares * es.emergencySnapshot) / totalSupply;  // ← live totalSupply
 ```
 
-**Issue:** Emergency mode uses `getTotalAum()` (line 450, 455, 468) which can diverge significantly from `feeStorage.aum`. The Safe wallet could have sent funds elsewhere, making `getTotalAum()` lower than the official AUM.
+After alice burns 50 of 100 shares, totalSupply is 50. Bob (also holding 50 shares) computes:
 
-**Impact:**
-- Emergency withdrawals calculated on incorrect AUM
-- Users might get less than entitled in emergency mode
-- `checkEmergencyThreshold` might trigger incorrectly
-
-**Recommended Fix:**
-Use `feeStorage.aum` consistently, or clearly document that `getTotalAum()` is for "on-chain available" vs "official AUM".
-
----
-
-### CRITICAL-6: No Input Validation on AUM Update
-**Location:** `SafeHedgeFundVault.sol:275-286`
-**Severity:** CRITICAL
-**Note:** Acknowledged in code as "Issue #13 (Missing Input Validation) intentionally not fixed per user request"
-
-**Description:**
-```solidity
-function updateAum(uint256 newAum) external onlyRole(AUM_UPDATER_ROLE) {
-    uint256 onChain = _getTotalOnChainLiquidity();
-    (uint256 adjustedAum, uint256 newNav) = feeStorage.accrueFeesOnAumUpdate(
-        newAum,
-        totalSupply(),
-        onChain,
-        _normalize,
-        _denormalize
-    );
-    emit AumUpdated(adjustedAum, newNav);
-}
+```
+entitlement = 50 * snapshot / 50 = snapshot   // the entire snapshot!
 ```
 
-**Issue:** While `accrueFeesOnAumUpdate` checks `newAum >= onChainLiquidity` (FeeManager.sol:86), there's no upper bound validation. A compromised AUM_UPDATER can set arbitrarily high AUM values.
+When `available >= remainingClaims`, the formula then pays bob the entire entitlement = the full snapshot, which is way more than his fair share. Even when liquidity is short and the proportional fallback fires, the inflated entitlement pumps the numerator and bob still over-claims.
 
-**Impact:**
-- Inflated NAV allows attacker to mint excessive shares
-- Deflated NAV (to just above onChain) steals value from existing holders
-- Performance fees can be manipulated
+Architecture doc explicitly said both AUM and supply were supposed to be snapshotted. Code only snapshotted AUM.
 
-**Recommended Fix:**
-Add reasonableness checks:
-```solidity
-uint256 lastAum = feeStorage.aum;
-if (newAum > lastAum * 2) revert AumChangeToLarge(); // Max 2x increase
-if (newAum < lastAum / 2) revert AumChangeTooLarge(); // Max 50% decrease
+**Fix:**
+- Add `emergencySnapshotSupply` field to `EmergencyStorage`.
+- `triggerEmergency` and `checkEmergencyThreshold` now take `currentSupply` and store it.
+- `emergencyWithdraw` uses `es.emergencySnapshotSupply` instead of the live value.
+
+Regression test: `test_BHIGH1_BCRIT3_emergencySplitsAvailableProportionally` — two users with equal shares, partial vault liquidity, both must receive exactly equal payouts (`assertEq`, not approximate).
+
+---
+
+## 5. Findings — fixed in this PR
+
+For each, the structural fix and the regression test that demonstrates it.
+
+### B-CRIT-1 — exit fee accrued 2×–N× per redeem
+- **Was:** `redeem()` mutated `accruedExitFees` for the slippage check; `_payout` mutated it again on every actual transfer; processor retries piled up more.
+- **Fix:** split FeeManager into `previewExitFee` (view) and `recordExitFee` (mutator). `redeem()` previews; `_payout` only records *after* the Safe transfer is verified to have moved the user's balance. Same pattern for entrance fee.
+- **Test:** `test_BCRIT1_exitFeeAccruedExactlyOnce_queuedPath`, `test_BCRIT1_exitFeeAccruedExactlyOnce_autoPayoutPath` — assert exit fee equals exactly 1× the gross fee.
+
+### B-CRIT-2 — entrance fee leaks on failed processings
+- **Was:** `_processDepositItem` and `processSingleDeposit` mutated the fee ledger before slippage / zero-shares checks. Failed retries piled up phantom accruals; user could cancel and walk away with a clean refund leaving phantom fee on the books.
+- **Fix:** preview-then-record. Fee is committed only after the operation is irreversibly successful (item marked processed, mint scheduled).
+- **Test:** `test_BCRIT2_failedSlippageDoesNotLeakEntranceFee` — three failed-slippage process passes followed by a cancel; assert `accruedFees().entrance == 0` throughout.
+
+### B-CRIT-3 — emergency divides by live totalSupply
+- See §4 above.
+
+### B-HIGH-2 — cancellation gas bomb
+- **Was:** `cancelDeposits` / `cancelRedemptions` looped the entire queue (head→tail) looking for the user's items. Per-user index mappings already existed but were unused — a user with deposits scattered across a long queue could hit gas limits trying to cancel.
+- **Fix:** iterate `userDepositIndices[user]` / `userRedemptionIndices[user]` directly. Skip entries where the underlying queue item has been deleted (`amount == 0`) or already processed.
+- **Test:** `test_BHIGH2_cancellationFindsOnlyUserItems` — queue items from three users, each cancels independently and recovers exactly their queued total.
+
+### B-HIGH-3 — emergency depends on Safe access
+- **Was:** `EmergencyManager.executePayout` tried vault first, then fell through to `execTransactionFromModule` → reverted with `ModuleNotEnabled` if the module had been disabled. Defeats the purpose of emergency mode.
+- **Fix:** `executePayout` now pays only from the vault's own balance. Deleted the Safe call and the `isModuleEnabled` parameter. Vault's `_emergencyPayout` updated. The pro-rata math in `emergencyWithdraw` already handles partial liquidity correctly — passing `baseToken.balanceOf(address(this))` as `available` means the formula scales payouts within whatever the vault holds, no Safe needed.
+- **Test:** `test_BHIGH3_emergencyWithdrawWorksWithSafeDisabled` — explicitly `safe.disableModule(vault)`, then verify a user can still withdraw against vault liquidity.
+
+### B-HIGH-4 — `_payout` fee transfer encodes wrong amount; double-counts on success
+- **Was:** Two-line block at the end of `_payout` that ABI-encoded `feeNative` (which was actually 18-decimal normalized, not native) into an `IERC20.transfer` from the Safe. Always reverted in practice (treated 18-dec quantity as native USDC). If it had ever succeeded, would have double-counted by adding `feeNative` to `accruedExitFees` on top of the previous mutation.
+- **Fix:** deleted the whole block. Exit fee revenue already lives at the Safe (gross stays at Safe, net goes to user). `payoutAccruedFees` correctly pulls it back via the same module path when the admin actually wants to pay out fees.
+- **Test:** covered by B-CRIT-1 tests (exit fee ledger matches gross × bps with no extra).
+
+### B-HIGH-5 — auto-process zero-shares strand
+- **Was:** `processSingleDeposit` returned `ok=true` with `shares==0` after committing state mutations. The caller (`_tryAutoProcessDeposit`) had a special-case that bailed without minting or refunding — user's tokens stranded in vault, queue item burned.
+- **Fix:** `shares == 0` now returns `false` (treated as slippage failure) without committing state. Item stays in queue; user can cancel and recover. Caller's special-case removed.
+- **Test:** `test_BHIGH5_autoProcessZeroShares_userCanRecover` — inflate NAV so shares would round to 0, deposit with auto-process, verify user can cancel and recover full deposit.
+
+---
+
+## 6. Open findings (out of scope for this PR)
+
+None of these are exploitable for fund loss. They're correctness/ergonomics/dead-code items; bundle into a follow-up PR.
+
+### ~~B-MED-1~~ — Fixed in cleanup PR
+~~Performance fee charged against `tempNav` (pre-fee), HWM bumped to `newNavPerShare` (post-fee).~~
+**Fix:** `_accrueFees` now returns the gross NAV to the caller, which passes it to `_updateHighWaterMark` instead of the post-fee `newNavPerShare`. HWM tracks the value the perf fee was just charged against, so a no-op update at the same AUM doesn't re-charge fees on the spread.
+**Test:** `test_BMED1_noPerfFeeOnNoOpUpdate`.
+
+### B-MED-2 — `getTotalAum` ≠ `feeStorage.aum` (naming, not math)
+**File:** `SafeHedgeFundVault.sol:675-680`
+`getTotalAum()` returns on-chain liquidity minus fees; `feeStorage.aum` is the last reported total. Both are valid concepts but the names don't communicate the difference. Rename to `getOnChainLiquidity()` and `getReportedAum()`.
+
+### ~~B-MED-3~~ — Fixed in cleanup PR
+~~Stale `pauseTimestamp` lingers after unpause.~~
+**Fix:** `unpause()` now `delete`s `emergencyStorage.pauseTimestamp`.
+**Test:** `test_BMED3_pauseTimestampClearedOnUnpause`.
+
+### B-MED-4 — `_getDecimals` silent fallback to 18
+**File:** `SafeHedgeFundVault.sol:694-697`
+If the base token reverts on `decimals()`, the constructor silently assumes 18. Better to revert.
+
+### B-LOW-1 — Dead overflow check in queue tail increments
+`QueueManager.sol:66-70` and the redemption queue equivalent. `==` fires only at exactly max; 0.8 catches the actual overflow on `++`. Either delete or use `>=`.
+
+### B-LOW-2 — `rescueETH` uses `.transfer` (2300 gas)
+`SafeHedgeFundVault.sol:444-451`. Use `call{value:}` with success check.
+
+### B-LOW-3 — Doc rot
+`README.md` and `ARCHITECTURE.md` reference an `AUMManager.sol` library that no longer exists.
+
+### B-LOW-4 — Dead helpers
+`_emitDeposited`, `_emitTokensRescued`, `_emitETHRescued`, `_revertCannotRescueBase` (`SafeHedgeFundVault.sol:572-586`) are unused since the inlining refactor.
+
+### ~~B-LOW-5~~ — Fixed in cleanup PR
+~~Depositing exactly `minDeposit` on a 6/8-dec token round-tripped to `minDeposit − 1 wei`, tripping the `minRedemption` check inside `redeem()`.~~
+**Fix:** `redeem()` now skips the `minRedemption` check when `shares == balanceOf(msg.sender)` (full-exit override). The check exists as a dust-spam guard for partial redemptions; it shouldn't block users from fully closing their position when round-trip rounding eats a wei or two. The `minAmountOut` slippage guard still applies on every redeem.
+**Tests:** `test_BLOW5_fullExitBypassesMinRedemption` (full exit succeeds), `test_partialRedemption_stillHonorsMinRedemption` (dust-spam guard still works for partials), `test_edge_minDepositRoundTripFullExit` in `PropertyFuzz.t.sol` (parameterized over decimals).
+
+---
+
+## 7. Test coverage
+
+```
+test/SafeHedgeFundVault.t.sol           — 9 regression tests
+├─ test_B1_batchProcessing_mintsAllItems
+├─ test_depositAndRedeemFlow                       (full deposit→AUM→redeem round trip)
+├─ test_BCRIT1_exitFeeAccruedExactlyOnce_queuedPath
+├─ test_BCRIT1_exitFeeAccruedExactlyOnce_autoPayoutPath
+├─ test_BCRIT2_failedSlippageDoesNotLeakEntranceFee
+├─ test_BHIGH1_BCRIT3_emergencySplitsAvailableProportionally  (also exercises B-CRIT-3 + B-HIGH-3)
+├─ test_BHIGH2_cancellationFindsOnlyUserItems
+├─ test_BHIGH3_emergencyWithdrawWorksWithSafeDisabled
+└─ test_BHIGH5_autoProcessZeroShares_userCanRecover
+
+test/fuzz/PropertyFuzz.t.sol            — 7 fuzzed properties × 3 decimals (6/8/18) = 21 + edge case
+test/fuzz/InvariantFuzz.t.sol           — 7 stateful invariants over 256 runs × 128 seq depth (~128K calls each)
+test/fuzz/Reentrancy.t.sol              — 3 adversarial reentrancy tests with hooked ERC-20
 ```
 
----
+All passing. See `docs/FUZZING.md` for the full property/invariant catalogue,
+what was found by fuzzing (B-LOW-5), and what's NOT covered by this suite.
 
-## HIGH SEVERITY ISSUES
+What's still missing:
 
-### HIGH-1: Emergency Withdrawal Accounting Mismatch
-**Location:** `EmergencyManager.sol:112-123`
-**Severity:** HIGH
+- **Decimals fuzz** — currently only 6-dec USDC. Parameterize over 6/8/18.
+- **Property tests** — pro-rata invariant under random share distributions and liquidity levels.
+- **Performance fee + HWM** — no scenario coverage of B-MED-1 timing.
+- **Multi-AUM-update sequences** — covering management fee accrual, HWM drawdown/recovery, the 3-day mgmt-fee gap.
+- **Config proposal lifecycle** — propose → cancel, propose → expire, cooldown enforcement.
+- **Fee payout** — `payoutAccruedFees` with vault-only liquidity vs needing the Safe.
+- **Reentrancy adversarial** — base token with a malicious hook (ERC777-style), prove `nonReentrant` blocks all the relevant entry points.
 
-**Description:**
-```solidity
-uint256 entitlement = (shares * es.emergencySnapshot) / totalSupply;
-uint256 payoutAmount = available >= remainingClaims
-    ? entitlement
-    : (entitlement * available) / remainingClaims;
-
-// Update state
-burn(msg.sender, shares);
-es.emergencyTotalWithdrawn += entitlement;  // ❌ Tracks entitlement, not actual payout
-
-// Payout
-payout(msg.sender, payoutAmount);  // Actual payout might be less
-```
-
-**Issue:** `emergencyTotalWithdrawn` tracks the full `entitlement`, but users might receive only `payoutAmount` (which could be less in underfunded scenarios). This means `remainingClaims` calculation is incorrect for subsequent withdrawals.
-
-**Impact:**
-- Late withdrawers get more than they should if early withdrawers got partial payouts
-- Or late withdrawers get nothing when there are still funds
-- Pro-rata distribution is broken
-
-**Recommended Fix:**
-```solidity
-es.emergencyTotalWithdrawn += payoutAmount;  // Track actual payouts
-```
+These are good next-PR work; none of them are blockers for the fixes in this branch.
 
 ---
 
-### HIGH-2: Queue Cancellation Gas Bomb
-**Location:** `QueueManager.sol:239-260, 262-283`
-**Severity:** HIGH
+## 8. Verdict (vault scope)
 
-**Description:**
-```solidity
-function cancelDeposits(
-    QueueStorage storage qs,
-    address user,
-    uint256 maxCancellations,
-    function(address, uint256) external transferBack
-) external returns (uint256 cancelled) {
-    if (qs.pendingDeposits[user] == 0) revert NoPending();
+The criticals and user-facing highs are closed. The remaining medium/low items are correctness polish, not security. The contract still has an explicitly trusted role (AUM_UPDATER) — that's a design choice with operational mitigations, not a bug.
 
-    uint256 count = 0;
-    for (uint256 i = qs.depositQueueHead; i < qs.depositQueueTail && count < maxCancellations; i++) {
-        // Loops through potentially ENTIRE queue
-    }
-}
-```
-
-**Issue:** If a user has deposits scattered throughout a large queue (e.g., positions at indices 0, 500, 1000), the loop must iterate through all 1000+ indices to find and cancel them.
-
-**Impact:**
-- Function can run out of gas with large queue
-- User cannot cancel their deposits
-- Funds stuck in queue
-- DoS for cancellation functionality
-
-**Recommended Fix:**
-Maintain a per-user mapping of queue indices:
-```solidity
-mapping(address => uint256[]) userDepositIndices;
-```
+For mainnet readiness I'd want, in addition to the open findings being closed:
+- A formal third-party audit (this is one Claude reading the source for an afternoon, not a substitute)
+- Property tests covering the pro-rata invariant under fuzz
+- Operational runbook for the keeper (AUM cadence, processor scheduling, what triggers the guardian)
+- A drill: actually disable the Safe module on a testnet deployment and verify users can emergency-withdraw end to end
 
 ---
 
-### HIGH-3: Decimal Normalization Inconsistency
-**Location:** Throughout FeeManager.sol
-**Severity:** HIGH
+# Part II — `SharedPool` (lending) review
 
-**Description:**
-The FeeManager uses three different approaches to decimal handling:
-1. Function pointers from vault (lines 82, 84) - ✓ Correct
-2. Hardcoded offset (lines 153, 207) - ❌ Wrong
-3. Assumes 18-decimal inputs (line 106) - ⚠️ Context-dependent
+The `claude/shared-pool` branch adds `contracts/lending/SharedPool.sol`, plus four new pool-only callbacks on the vault (`mintForPool`, `burnFromUser`, `addToAum`, `subFromAum`) and three timelocked config keys (`swapFeeBps`, `lltvBps`, `borrowRateBps`). This part reviews those changes.
 
-**Impact:**
-- Entrance and exit fees calculated incorrectly for non-6-decimal tokens
-- Inconsistent internal accounting
-- Potential loss of funds or bricking
+Full design walkthrough is in `docs/LENDING.md`. This section only covers security findings.
 
-**Recommended Fix:**
-Always use the function pointers passed from the vault. Remove `_getDecimalOffset()` entirely.
+## P2.0 — Threat model recap
 
----
+Same Safe-as-source-of-funds threat model as the vault. The pool can:
+- Mint and burn HFS via `vault.mintForPool` / `vault.burnFromUser`
+- Adjust `feeStorage.aum` via `vault.addToAum` / `vault.subFromAum`
 
-## MEDIUM SEVERITY ISSUES
+A buggy pool could corrupt `fs.aum` (NAV math goes wrong) or mint arbitrary HFS (dilute existing holders). Both are restricted to the pool address (set once via `setSharedPool`), so the trust assumption reduces to: **the pool contract code is correct**, and the keeper hasn't accidentally pointed `setSharedPool` at a malicious address.
 
-### MEDIUM-1: NAV Staleness Not Checked in Emergency Mode
-**Location:** `SafeHedgeFundVault.sol:445-476`
-**Severity:** MEDIUM
+The pool itself doesn't have Safe module access. It interacts with the fund's USDC only through transfers in/out of its own balance. The Safe's USDC isn't directly touchable by pool operations — fees and reserves still flow through the vault and its module path.
 
-**Description:**
-Emergency functions like `triggerEmergency()`, `checkEmergencyThreshold()`, and `emergencyWithdraw()` use `getTotalAum()` which relies on current token balances, but they don't check if the official AUM is stale.
+## P2.1 — Walkthrough of state transitions
 
-**Impact:**
-- Emergency mode triggered based on stale data
-- Withdrawals calculated on outdated AUM
-- Users get incorrect amounts
+| Operation | usdcReserve | totalSupply | fs.aum | Notes |
+|---|---|---|---|---|
+| `supply(amount)` | +amount | 0 | 0 | Fund-internal move (Safe→pool) doesn't change total fund value; keeper reconciles at next updateAum |
+| `swapUsdcForHfs(in)` | +in | +hfsOut | +in | Slippage value retained in pool; NAV ↑ correctly via the `addToAum` callback |
+| `swapHfsForUsdc(in)` | -out | -in | -out | Symmetric; NAV ↑ from slippage |
+| `depositCollateral(amt)` | 0 | 0 | 0 | HFS moves from user to pool; locked, not in AMM |
+| `withdrawCollateral(amt)` | 0 | 0 | 0 | Reverse; health check enforced |
+| `borrow(amt)` | -amt | 0 | 0 | USDC out, loan claim in (offsetting); net fund value unchanged |
+| `repay(amt)` | +amt | 0 | 0 | Symmetric |
+| `_liquidate(b)` | 0 | -col (burn) | -debt | Loan claim written off; collateral burned |
+| `sweepLiquidations` | sum of above | sum of above | sum of above | Iterates active borrowers, applies `_liquidate` for unhealthy ones |
 
-**Recommended Fix:**
-Add AUM freshness check before entering emergency mode.
+Every operation that changes `totalSupply` is paired with a matching `fs.aum` adjustment, either via the pool callback or via a corresponding offset (loan claim) that the keeper reconciles. **No supply changes can leave NAV stale**, which closes the front-run-the-keeper exploit window.
 
----
+## P2.2 — Verified properties (from tests)
 
-### MEDIUM-2: Auto-Process Failures Not Tracked
-**Location:** `SafeHedgeFundVault.sol:520-558`
-**Severity:** MEDIUM
+`test/SharedPool.t.sol` — 24 tests, all passing.
 
-**Description:**
-When auto-processing fails (e.g., slippage, zero shares), the deposit remains in the queue but is not marked as "failed". The next batch processor might process it successfully, but there's no tracking of auto-process failures.
+| Property | Test |
+|---|---|
+| `hfsReserve` is derived from `usdcReserve` and NAV (no stored state) | `test_hfsReserve_isDerivedFromUsdcAndNav` |
+| `hfsReserve` auto-updates after operations (no rebalance call needed) | `test_hfsReserve_autoTracksAfterSwap` |
+| xy=k slippage applies in both directions | `test_swap_*ForHfs_appliesSlippage`, `test_swap_hfsForUsdc_appliesSlippage` |
+| **NAV captures slippage immediately via callback** | `test_swap_navIncreasesAfterSwap_viaCallback`, `test_swapHfsForUsdc_navIncreases` |
+| **No stale-NAV exploit window** (Bob's deposit gets fair shares right after Alice's swap) | `test_noStaleNavExploitBetweenSwapAndUpdate` |
+| Borrow / repay are NAV-neutral (loan claim offsets USDC movement) | `test_borrow_doesNotMoveNav`, `test_repay_doesNotMoveNav` |
+| Liquidation correctly subtracts debt from `fs.aum` | `test_liquidation_writesOffDebtFromAum` |
+| Sweep liquidates only unhealthy positions, leaves healthy ones | `test_sweepLiquidations_onlyUnhealthyBorrowers` |
+| Sweep auto-runs on `updateAum` | `test_sweepLiquidations_onAumUpdate` |
+| LLTV enforcement on borrow | `test_borrow_revertsAboveLltv`, `test_borrow_atExactLltvSucceeds` |
+| Withdraw-collateral revert on health violation | `test_withdrawCollateral_revertsIfWouldBecomeUnhealthy` |
+| Block-level swap freeze in same block as `updateAum` | `test_swapFrozen_inSameBlockAsUpdateAum` |
+| Repay caps at outstanding debt (no over-pull from user) | `test_repay_capsAtDebt` |
+| Zero-amount ops revert | `test_swap_zeroAmount_reverts`, `test_zeroAmountOps_revert` |
+| Same-block round-trip (deposit + swap-out) loses money for user | `test_sameBlockRoundTrip_noExploit` |
+| Direct USDC transfer to pool isn't tracked but doesn't break ops | `test_directUsdcTransfer_notReflectedInReserve` |
+| Pool-only callbacks reject external callers | `test_onlyPool_canCallVaultCallbacks` |
+| Vault-only `sweepLiquidations` rejects external callers | `test_onlyVault_canCallSweepLiquidations` |
 
-**Impact:**
-- User deposits sit in queue longer than expected
-- No way to query which deposits failed auto-process
-- Hard to debug issues
+## P2.3 — Findings
 
-**Recommended Fix:**
-Add a `failedAutoProcess` flag to QueueItem struct.
+### Critical / High / Medium
 
----
+None.
 
-### MEDIUM-3: Performance Fee Calculated on Snapshot NAV
-**Location:** `FeeManager.sol:106-109`
-**Severity:** MEDIUM
+### Low
 
-**Description:**
-```solidity
-uint256 tempNav = (normalize(newAum) * 1e18) / totalSupply;
-if (tempNav > fs.highWaterMark && fs.performanceFeeBps > 0) {
-    perfFee = ((tempNav - fs.highWaterMark) * fs.performanceFeeBps / FEE_DENOMINATOR) * totalSupply / 1e18;
-    fs.accruedPerformanceFees += perfFee;
-}
-```
+**P2-L1 — `usdcReserve` can desync from actual `usdc.balanceOf(this)`**
 
-Performance fees are accrued based on NAV BEFORE the fees are deducted. This means the NAV calculated at line 126 will be lower than `tempNav`, but the HWM is updated based on the post-fee NAV.
+If anyone transfers USDC directly to the pool address (bypassing `supply`), the actual balance grows but `usdcReserve` doesn't. The "extra" USDC sits stuck — no withdrawal path tracks it.
 
-**Impact:**
-- Performance fees might be over-charged
-- High water mark logic could be incorrect
+**Impact:** USDC sent directly is permanently locked in the pool, contributing nothing to swap depth or lending capacity. Not exploitable; just inefficient.
 
-**Recommended Fix:**
-Calculate performance fees iteratively or adjust HWM update logic.
+**Mitigation (not implemented in v1):** add an admin-only `sweepStuckUsdc()` that reads `usdc.balanceOf(this) - usdcReserve` and accounts for it (either bumps `usdcReserve` or rescues to the Safe). For F&F scale, just document "don't do that."
+
+**Test:** `test_directUsdcTransfer_notReflectedInReserve` confirms the desync behavior is benign.
 
 ---
 
-### MEDIUM-4: Config Proposal Can Be Front-Run
-**Location:** `ConfigManager.sol:81-108`
-**Severity:** MEDIUM
+**P2-L2 — Pool operations continue while vault is paused**
 
-**Description:**
-When an admin creates a proposal, anyone watching the mempool can see the parameters and create their own proposal with different parameters. While only admins can create proposals, if there are multiple admins, they could front-run each other.
+`vault.pause()` halts vault-level deposits and redemptions. It does NOT halt pool operations (swaps, borrows, supply). If admin pauses because of an emergency, users can still drain pool USDC via `swapHfsForUsdc`.
 
-**Impact:**
-- Proposal conflicts
-- Potential governance manipulation if multiple admins
+**Impact:** the protective intent of pause is partial. Existing borrowers can continue to borrow more; new positions can be opened. Liquidation sweep still runs at next `updateAum`.
 
-**Recommended Fix:**
-Use commit-reveal scheme or proposal queue.
+**Mitigation (not implemented in v1):** add a `notPausedOnVault` modifier to mutating pool functions reading `vault.paused()`. Probably skip `repay` (always allow repayment to clear positions) and `withdrawCollateral` for the same reason. For F&F scale, the vault's emergency-mode flow handles full-fund crises; the pool-side gap is small.
 
 ---
 
-### MEDIUM-5: No Emergency Exit for Proposal System
-**Location:** `ConfigManager.sol`
-**Severity:** MEDIUM
+**P2-L3 — Deployment ordering matters**
 
-**Description:**
-If a malicious proposal gets through the timelock, there's no way to stop it except creating a new proposal with the old values, which also requires a timelock wait.
+If admin calls `pool.supply()` BEFORE any HFS exists (totalSupply == 0), the supplied USDC inflates AUM but has no shares to dilute against. After the first `vault.deposit` mints shares at the default initial NAV, the entire pool's USDC effectively gets attributed to the first depositor.
 
-**Impact:**
-- Malicious config changes can't be emergency-stopped
-- Time window of vulnerability
+**Impact:** Operational error during deployment. The first depositor (probably the fund admin) over-extracts value at others' expense — but since the same admin is supplying both, it's value-neutral.
 
-**Recommended Fix:**
-Add emergency cancel function for GUARDIAN_ROLE.
+**Mitigation (documented):** Deploy in this order:
+1. Deploy vault, set initial 1-USDC AUM seed.
+2. Deploy pool, wire via `setSharedPool`.
+3. Admin deposits USDC into vault → mints HFS shares.
+4. Process the deposit, refresh AUM.
+5. Admin supplies USDC to pool, refresh AUM again.
 
----
-
-## LOW SEVERITY ISSUES
-
-### LOW-1: Event Parameter Order Inconsistency
-Multiple events have inconsistent parameter ordering.
-
-### LOW-2: Missing Zero-Address Checks
-Several admin functions don't check for zero addresses in updates.
-
-### LOW-3: Gas Inefficiency in Queue Cleanup
-Queue cleanup could be optimized with batch operations.
-
-### LOW-4: No Maximum Fee Caps
-While ConfigManager has MAX constants, fees could still be set very high.
-
-### LOW-5: Reentrancy Guards Not on All External Functions
-Some view functions that make external calls lack reentrancy protection.
+`test/SharedPool.t.sol::setUp()` follows this order; replicate in production deployment script.
 
 ---
 
-## RECOMMENDATIONS
+**P2-L4 — Liquidation sweep gas grows linearly with `_activeBorrowers.length()`**
 
-### Immediate Actions Required:
-1. Fix CRITICAL-1: Infinite recursion in `_burn()`
-2. Fix CRITICAL-2: Remove hardcoded decimal offset
-3. Fix CRITICAL-4: Fix overflow check order
-4. Review and fix CRITICAL-3: Redemption burn ordering
+At F&F scale (5–50 borrowers) this is fine. At higher scale, a sweep with many liquidations could exceed the block gas limit, leaving some unhealthy positions un-liquidated.
 
-### High Priority:
-1. Fix emergency withdrawal accounting (HIGH-1)
-2. Optimize queue cancellation (HIGH-2)
-3. Standardize decimal handling (HIGH-3)
+**Mitigation (not implemented in v1):** add a `maxToProcess` parameter to `sweepLiquidations`, similar to the deposit/redemption queue's `maxToProcess`. Vault would call `sweep(N)` per `updateAum`, with the keeper choosing N based on gas budget. Skip for F&F.
 
-### Testing Recommendations:
-1. Add fuzzing tests for decimal handling with various token decimals (6, 8, 18)
-2. Test emergency withdrawal under underfunded scenarios
-3. Test queue operations with maximum queue sizes
-4. Test all functions with boundary values (max uint256, zero, etc.)
+### Informational
 
----
+**P2-I1 — xy=k integer rounding favors the user by ≤1 wei**
 
-## CONCLUSION
+`hfsOut = hfsRes - (k / newUsdc)` — `k / newUsdc` rounds down, so subtraction gives a slightly larger `hfsOut` than the precise math would. Standard rounding direction issue in xy=k AMMs; mitigated in Uniswap V2 by `(k * 1000 + 999) / (1000 * newUsdc)`. At HFS's 18-dec resolution, the extra wei is economically zero.
 
-This contract system has several critical bugs that must be fixed before deployment. The infinite recursion bug (CRITICAL-1) makes the contract completely non-functional for withdrawals. The decimal handling issues (CRITICAL-2, HIGH-3) would cause catastrophic fund loss for non-USDC/USDT tokens.
+**P2-I2 — `_liquidate` doesn't accrue interest before snapshotting `debt`**
 
-**Recommendation: DO NOT DEPLOY until all CRITICAL issues are resolved and HIGH issues are reviewed.**
+`sweepLiquidations` calls `_accrueBorrowerInterest(b)` before checking `_isUnhealthy(b)`, so debt is fresh at the health check. Then `_liquidate` reads `borrowOf[borrower]` directly without re-accruing — but no time has passed (same tx), so the freshly-accrued debt is still current. Correct, just worth noting for code readers.
+
+**P2-I3 — `notFrozen` modifier checks `block.number == vault.lastAumBlock()`**
+
+Specifically equality, not "≥". Once `block.number` advances past `lastAumBlock`, swaps work. Always exactly one block of freeze. Behaves as intended.
+
+## P2.4 — Simplifications applied during this review
+
+- **Removed unused `NotUnhealthy` error** (declared but never thrown).
+- **Cached `baseDecimals` and pre-computed `DECIMAL_FACTOR` as immutables in pool.** Saves a `vault.baseDecimals()` external call on every `swap` and health check. ~250 gas per call × N call sites.
+- (Earlier: dropped `USDC_DECIMALS_FACTOR` and `lastInterestAccrualTimestamp` — both set but never read.)
+
+## P2.5 — Known limitations (for v2)
+
+Documented in `docs/LENDING.md §6`. Summary:
+
+1. **Vault deposit/redeem still has the daily-staleness window** — pool callbacks fix the swap path; vault-side flows haven't been updated to use the same pattern. Pre-existing concern, not regressed.
+2. **Fund-only USDC supply in practice** — `supply()` is open but no LP shares yet; external suppliers would just be donating.
+3. **Fixed-rate borrow** — no utilization curve.
+4. **No flash-loan resistance** — block-level swap freeze covers the obvious vector around `updateAum`; broader analysis is a v2 concern.
+5. **Liquidation has no third-party incentive** — auto-sweep only. Keeper SLA matters.
+6. **Pool always holds zero HFS for AMM purposes** — the only HFS the pool holds is borrower collateral. Worth knowing for invariant checks.
+
+## P2.6 — Verdict (lending scope)
+
+The lending design is small and tightly scoped. ~280 lines of pool code + ~30 lines of vault changes. The core property (NAV stays correct between keeper updates via `addToAum`/`subFromAum` callbacks) is verified by an explicit test that simulates the would-be exploit.
+
+No critical or high findings. Four low findings, all either deployment guidance or v2-scope features.
+
+For mainnet readiness on this part:
+- Same as Part I: a real third-party audit.
+- Specific to lending: model the bad-debt scenario under various NAV trajectories.
+- Test the swap-and-borrow flow on a testnet with realistic gas costs (Anvil tests are gas-accurate but block-time / mempool dynamics differ).
+- Define and document the keeper SLA explicitly. The whole liquidation mechanism depends on `updateAum` running.

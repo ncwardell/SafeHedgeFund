@@ -1,0 +1,24 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+# Note: lib/ is intentionally tracked as git submodules (the foundry default).
+# Run `git submodule update --init --recursive` after cloning, or `forge install`
+# to fetch them.
+
+# Nix
+result
+result-*
+.direnv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Portal
+portal/node_modules/
+portal/.next/
+portal/out/
+portal/.env*
+!portal/.env.example

@@ -65,7 +65,7 @@ export function useVaultStatus() {
   const emergencyMode = useReadContract({
     address: VAULT_ADDRESS,
     abi: VAULT_ABI,
-    functionName: 'emergencyMode',
+    functionName: 'isEmergencyActive',
   })
 
   return {

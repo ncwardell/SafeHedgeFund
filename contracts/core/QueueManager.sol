@@ -106,27 +106,31 @@ library QueueManager {
         uint256 queueIdx,
         uint256 currentNav,
         function(uint256) view returns (uint256) normalize,
-        function(uint256) view returns (uint256),
-        function(uint256) internal returns (uint256, uint256) accrueEntranceFee
+        function(uint256) view returns (uint256, uint256) previewEntranceFee,
+        function(uint256) internal recordEntranceFee
     ) internal returns (bool success, uint256 sharesMinted, uint256 netAmount) {
         if (queueIdx >= qs.depositQueueTail || qs.depositQueue[queueIdx].processed) return (false, 0, 0);
 
         QueueItem storage item = qs.depositQueue[queueIdx];
         if (item.amount == 0) return (false, 0, 0);
 
-        (uint256 netAmountNative, ) = accrueEntranceFee(item.amount);
+        (uint256 netAmountNative, uint256 feeNative) = previewEntranceFee(item.amount);
         uint256 netAmountNormalized = normalize(netAmountNative);
 
         sharesMinted = currentNav > 0
             ? (netAmountNormalized * 1e18) / currentNav
             : netAmountNormalized;
 
-        if (sharesMinted < item.minOutput) {
+        // shares==0 is a slippage failure, not a "successful zero-share mint"
+        // (B-HIGH-5): the previous version returned ok=true with shares=0,
+        // and the caller's mint path bailed without refunding the user.
+        if (sharesMinted < item.minOutput || sharesMinted == 0) {
             return (false, 0, 0);
         }
 
         item.processed = true;
         qs.pendingDeposits[item.user] -= item.amount;
+        if (feeNative > 0) recordEntranceFee(feeNative);
 
         success = true;
         netAmount = netAmountNative;
@@ -137,7 +141,9 @@ library QueueManager {
         uint256 maxToProcess,
         uint256 currentNav,
         function(uint256) view returns (uint256) normalize,
-        function(uint256) internal returns (uint256, uint256) accrueEntranceFee,
+        function(uint256) view returns (uint256, uint256) previewEntranceFee,
+        function(uint256) internal recordEntranceFee,
+        function(address, uint256, uint256, uint256) internal mintAndDeploy,
         function(uint256, address, uint256, string memory) internal emitDepositSkipped,
         function() view returns (uint256) getMaxBatchSize
     ) internal returns (uint256 processed) {
@@ -146,7 +152,10 @@ library QueueManager {
 
         uint256 start = qs.depositQueueHead;
         for (uint256 i = 0; i < maxToProcess && start + i < qs.depositQueueTail; i++) {
-            if (_processDepositItem(qs, start + i, currentNav, normalize, accrueEntranceFee, emitDepositSkipped)) {
+            if (_processDepositItem(
+                qs, start + i, currentNav,
+                normalize, previewEntranceFee, recordEntranceFee, mintAndDeploy, emitDepositSkipped
+            )) {
                 processed++;
             }
         }
@@ -155,18 +164,30 @@ library QueueManager {
         if (processed > 0) emit QueueProcessed("deposit", processed);
     }
 
+    /// @dev Processes one deposit end-to-end. Computes the would-be shares
+    /// using a PURE preview of the entrance fee, runs slippage / zero-shares
+    /// checks, and only commits state (mark processed + decrement pending +
+    /// record fee + mint) once every check has passed. Pre-fix the entrance
+    /// fee was committed before the slippage check, so failed-then-cancelled
+    /// deposits left phantom fee on the ledger (B-CRIT-2).
+    ///
+    /// Mint MUST happen here, not in a second pass — _cleanDepositQueue
+    /// advances head past processed items, so a second pass reading
+    /// post-cleanup head would silently miss them (B1, fixed earlier).
     function _processDepositItem(
         QueueStorage storage qs,
         uint256 idx,
         uint256 currentNav,
         function(uint256) view returns (uint256) normalize,
-        function(uint256) internal returns (uint256, uint256) accrueEntranceFee,
+        function(uint256) view returns (uint256, uint256) previewEntranceFee,
+        function(uint256) internal recordEntranceFee,
+        function(address, uint256, uint256, uint256) internal mintAndDeploy,
         function(uint256, address, uint256, string memory) internal emitDepositSkipped
     ) private returns (bool success) {
         QueueItem storage item = qs.depositQueue[idx];
         if (item.processed || item.amount == 0) return false;
 
-        (uint256 netAmountNative, ) = accrueEntranceFee(item.amount);
+        (uint256 netAmountNative, uint256 feeNative) = previewEntranceFee(item.amount);
         uint256 netAmount = normalize(netAmountNative);
         uint256 shares = currentNav > 0 ? (netAmount * 1e18) / currentNav : netAmount;
 
@@ -174,9 +195,15 @@ library QueueManager {
             emitDepositSkipped(idx, item.user, item.amount, "slippage");
             return false;
         }
+        if (shares == 0) {
+            emitDepositSkipped(idx, item.user, item.amount, "zero shares");
+            return false;
+        }
 
         item.processed = true;
         qs.pendingDeposits[item.user] -= item.amount;
+        if (feeNative > 0) recordEntranceFee(feeNative);
+        mintAndDeploy(item.user, item.amount, shares, netAmountNative);
         return true;
     }
 
@@ -226,6 +253,11 @@ library QueueManager {
         return true;
     }
 
+    /// @dev Iterates only the caller's own queue indices (B-HIGH-2). Pre-fix
+    /// these scanned the whole queue head→tail, so a user with an item at
+    /// index 999 of a 1000-item queue couldn't cancel without hitting the
+    /// block gas limit. The per-user index list is already maintained at
+    /// queueDeposit / queueRedemption time, so we only need to walk it.
     function cancelDeposits(
         QueueStorage storage qs,
         address user,
@@ -234,17 +266,20 @@ library QueueManager {
     ) internal returns (uint256 cancelled) {
         if (qs.pendingDeposits[user] == 0) revert NoPending();
 
+        uint256[] storage indices = qs.userDepositIndices[user];
         uint256 count = 0;
-        for (uint256 i = qs.depositQueueHead; i < qs.depositQueueTail && count < maxCancellations; i++) {
-            QueueItem storage item = qs.depositQueue[i];
-            if (item.user == user && !item.processed && item.amount > 0) {
-                item.processed = true;
-                qs.pendingDeposits[user] -= item.amount;
-                transferBack(user, item.amount);
-                emit DepositCancelled(user, item.amount);
-                cancelled += item.amount;
-                count++;
-            }
+        for (uint256 i = 0; i < indices.length && count < maxCancellations; i++) {
+            uint256 idx = indices[i];
+            if (idx >= qs.depositQueueTail) continue;
+            QueueItem storage item = qs.depositQueue[idx];
+            if (item.processed || item.user != user || item.amount == 0) continue;
+
+            item.processed = true;
+            qs.pendingDeposits[user] -= item.amount;
+            cancelled += item.amount;
+            transferBack(user, item.amount);
+            emit DepositCancelled(user, item.amount);
+            count++;
         }
         _cleanDepositQueue(qs);
     }
@@ -257,17 +292,20 @@ library QueueManager {
     ) internal returns (uint256 cancelled) {
         if (qs.pendingRedemptions[user] == 0) revert NoPending();
 
+        uint256[] storage indices = qs.userRedemptionIndices[user];
         uint256 count = 0;
-        for (uint256 i = qs.redemptionQueueHead; i < qs.redemptionQueueTail && count < maxCancellations; i++) {
-            QueueItem storage item = qs.redemptionQueue[i];
-            if (item.user == user && !item.processed) {
-                item.processed = true;
-                qs.pendingRedemptions[user] -= item.amount;
-                mintBack(user, item.amount);
-                emit RedemptionCancelled(user, item.amount);
-                cancelled += item.amount;
-                count++;
-            }
+        for (uint256 i = 0; i < indices.length && count < maxCancellations; i++) {
+            uint256 idx = indices[i];
+            if (idx >= qs.redemptionQueueTail) continue;
+            QueueItem storage item = qs.redemptionQueue[idx];
+            if (item.processed || item.user != user) continue;
+
+            item.processed = true;
+            qs.pendingRedemptions[user] -= item.amount;
+            cancelled += item.amount;
+            mintBack(user, item.amount);
+            emit RedemptionCancelled(user, item.amount);
+            count++;
         }
         _cleanRedemptionQueue(qs);
     }

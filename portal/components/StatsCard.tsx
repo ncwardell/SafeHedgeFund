@@ -1,4 +1,4 @@
-import { LucideIcon } from 'lucide-react'
+import {LucideIcon} from 'lucide-react'
 
 interface StatsCardProps {
   title: string
@@ -12,49 +12,51 @@ interface StatsCardProps {
   loading?: boolean
 }
 
-export function StatsCard({ title, value, subtitle, icon: Icon, trend, loading }: StatsCardProps) {
+export function StatsCard({title, value, subtitle, icon: Icon, trend, loading}: StatsCardProps) {
   if (loading) {
     return (
-      <div className="card animate-pulse">
-        <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/2 mb-4"></div>
-        <div className="h-8 bg-gray-200 dark:bg-gray-700 rounded w-3/4 mb-2"></div>
-        <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-1/3"></div>
+      <div className="card">
+        <div className="skeleton h-3 w-1/3 mb-4" />
+        <div className="skeleton h-8 w-2/3 mb-3" />
+        <div className="skeleton h-3 w-1/4" />
       </div>
     )
   }
 
   return (
-    <div className="card">
-      <div className="flex items-start justify-between">
-        <div className="flex-1">
-          <p className="text-sm font-medium text-gray-600 dark:text-gray-400">
+    <div className="card group transition-shadow hover:shadow-glow">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium uppercase tracking-wider text-surface-500 dark:text-surface-400">
             {title}
           </p>
-          <p className="mt-2 text-3xl font-bold text-gray-900 dark:text-white">
+          <p className="mt-2 text-2xl md:text-3xl font-semibold tracking-tight text-surface-900 dark:text-surface-50 font-tabular truncate">
             {value}
           </p>
           {subtitle && (
-            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+            <p className="mt-1 text-sm text-surface-500 dark:text-surface-400 truncate">
               {subtitle}
             </p>
           )}
           {trend && (
-            <div className="mt-2 flex items-center">
+            <div className="mt-2 flex items-center gap-2">
               <span
-                className={`text-sm font-semibold ${
-                  trend.isPositive ? 'text-green-600' : 'text-red-600'
+                className={`pill ${
+                  trend.isPositive
+                    ? 'bg-accent-emerald/10 text-accent-emerald'
+                    : 'bg-accent-rose/10 text-accent-rose'
                 }`}
               >
                 {trend.isPositive ? '+' : ''}
                 {trend.value.toFixed(2)}%
               </span>
-              <span className="ml-2 text-xs text-gray-500">vs last period</span>
+              <span className="text-xs text-surface-500">vs last period</span>
             </div>
           )}
         </div>
         {Icon && (
-          <div className="p-3 bg-primary-50 dark:bg-primary-900 rounded-lg">
-            <Icon className="h-6 w-6 text-primary-600 dark:text-primary-400" />
+          <div className="shrink-0 p-2.5 rounded-xl bg-primary-50 dark:bg-primary-900/30 ring-1 ring-primary-100/60 dark:ring-primary-800/40">
+            <Icon className="h-5 w-5 text-primary-600 dark:text-primary-300" />
           </div>
         )}
       </div>

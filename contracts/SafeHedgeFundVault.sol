@@ -4,14 +4,18 @@ pragma solidity 0.8.24;
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 
 import "./core/ConfigManager.sol";
 import "./core/FeeManager.sol";
 import "./core/QueueManager.sol";
 import "./core/EmergencyManager.sol";
+
+interface ISharedPool {
+    function sweepLiquidations() external;
+}
 
 contract SafeHedgeFundVault is
     ERC20,
@@ -84,6 +88,15 @@ contract SafeHedgeFundVault is
     uint256 public maxAumAge;
     uint256 public maxBatchSize;
 
+    // Lending config (mirrored from ConfigManager via _applyConfigChange)
+    uint256 public swapFeeBps;
+    uint256 public lltvBps;
+    uint256 public borrowRateBps;
+
+    // Pool wiring
+    address public sharedPool;
+    uint256 public lastAumBlock;
+
     IERC20 public immutable baseToken;
     address public immutable safeWallet;
     uint8 public immutable baseDecimals;
@@ -103,6 +116,9 @@ contract SafeHedgeFundVault is
     event PayoutFailed(address indexed user, uint256 amount, string reason);
     event ProposalExecutionFailed(bytes32 indexed id, string reason);
     event Initialized(uint256 timestamp);
+    event SharedPoolSet(address indexed pool);
+
+    error OnlyPool();
 
     constructor(
         address _baseToken,
@@ -140,6 +156,14 @@ contract SafeHedgeFundVault is
         feeStorage.hwmRecoveryPeriod = 90 days;
 
         feeStorage.decimalFactor = DECIMAL_FACTOR;
+
+        // Lending pool defaults. Set in constructor (rather than via the
+        // 3-day timelocked ConfigManager flow) so a freshly-deployed
+        // vault has working lending parameters from block 1. Subsequent
+        // changes go through the timelocked propose/execute flow.
+        swapFeeBps = 30;       // 0.30%
+        lltvBps = 5000;        // 50%
+        borrowRateBps = 800;   // 8% APR
 
         emit Initialized(block.timestamp);
     }
@@ -189,18 +213,30 @@ contract SafeHedgeFundVault is
         aumNotStale
         nonReentrant
     {
-        if (shares == 0 || balanceOf(msg.sender) < shares) revert InvalidShares();
+        uint256 userBalance = balanceOf(msg.sender);
+        if (shares == 0 || userBalance < shares) revert InvalidShares();
+        // B-LOW-5: full-exit override. minRedemption is a dust-spam guard;
+        // it shouldn't block a user from fully closing their position when
+        // round-trip rounding (worst case ~1 wei on non-18-dec tokens)
+        // makes payout fall just under minRedemption. Slippage protection
+        // (minAmountOut) is the user's own check and still applies.
+        bool fullExit = (shares == userBalance);
 
         uint256 nav = navPerShare();
         uint256 gross = (shares * nav) / 1e18;
-        (uint256 net, ) = feeStorage.accrueExitFee(gross);
+        // Preview only — exit fee is recorded inside _payout when the actual
+        // transfer succeeds (B-CRIT-1).
+        (uint256 net, ) = feeStorage.previewExitFee(gross);
 
         if (net == 0) revert ZeroAmountCalculated();
 
         uint256 payout = _denormalize(net);
-        if (payout < minRedemption) revert BelowMinimum();
+        if (!fullExit && payout < minRedemption) revert BelowMinimum();
         if (payout < minAmountOut) revert SlippageTooHigh();
 
+        // INVARIANT: _burn must be reverted by any failure on the path below.
+        // queueRedemption MUST revert (not return false) when it can't queue,
+        // so that we don't end up with shares burned but no claim recorded.
         _burn(msg.sender, shares);
 
         if (autoPayoutRedemptions) {
@@ -227,6 +263,14 @@ contract SafeHedgeFundVault is
         );
 
         emit AumUpdated(adjustedAum, newNav);
+
+        // NAV is a step function — only changes here. So this is the unique
+        // moment where lending positions can become unhealthy. Mark the
+        // block (for pool's swap freeze) and sweep liquidations.
+        lastAumBlock = block.number;
+        if (sharedPool != address(0)) {
+            ISharedPool(sharedPool).sweepLiquidations();
+        }
     }
 
     function processDepositQueue(uint256 maxToProcess)
@@ -239,18 +283,16 @@ contract SafeHedgeFundVault is
     {
         uint256 nav = navPerShare();
 
-        uint256 processed = queueStorage.processDepositBatch(
+        queueStorage.processDepositBatch(
             maxToProcess,
             nav,
             _normalize,
-            _accrueEntranceFee,
+            _previewEntranceFee,
+            _recordEntranceFee,
+            _mintAndDeploy,
             _emitDepositSkipped,
             _getMaxBatchSize
         );
-
-        if (processed > 0) {
-            _processDepositMints(queueStorage.depositQueueHead, processed, nav);
-        }
     }
 
     function processRedemptionQueue(uint256 maxToProcess)
@@ -367,6 +409,12 @@ contract SafeHedgeFundVault is
             feeStorage.hwmRecoveryPct = value;
         } else if (keyHash == keccak256("hwmRecoveryPeriod")) {
             feeStorage.hwmRecoveryPeriod = value;
+        } else if (keyHash == keccak256("swapFeeBps")) {
+            swapFeeBps = value;
+        } else if (keyHash == keccak256("lltvBps")) {
+            lltvBps = value;
+        } else if (keyHash == keccak256("borrowRateBps")) {
+            borrowRateBps = value;
         }
     }
 
@@ -376,7 +424,7 @@ contract SafeHedgeFundVault is
         whenPaused
     {
         uint256 currentAum = getTotalAum();
-        emergencyStorage.triggerEmergency(currentAum);
+        emergencyStorage.triggerEmergency(currentAum, totalSupply());
     }
 
     function checkEmergencyThreshold() external {
@@ -384,6 +432,7 @@ contract SafeHedgeFundVault is
         emergencyStorage.checkEmergencyThreshold(
             paused(),
             currentAum,
+            totalSupply(),
             feeStorage.aumTimestamp
         );
     }
@@ -393,14 +442,39 @@ contract SafeHedgeFundVault is
     }
 
     function emergencyWithdraw(uint256 shares) external nonReentrant {
-        uint256 currentAum = getTotalAum();
+        // B-HIGH-3: pay only from vault balance during emergency. Including
+        // the Safe in `available` would inflate the pro-rata denominator
+        // beyond what we can actually pay, leaving late users short.
+        uint256 vaultLiquidity = baseToken.balanceOf(address(this));
         emergencyStorage.emergencyWithdraw(
             shares,
-            totalSupply(),
-            currentAum,
+            0, // legacy arg, ignored — see EmergencyManager
+            vaultLiquidity,
             _burnShares,
             _emergencyPayout
         );
+    }
+
+    function isEmergencyActive() external view returns (bool) {
+        return emergencyStorage.emergencyMode;
+    }
+
+    function emergencyInfo()
+        external
+        view
+        returns (
+            bool active,
+            uint256 snapshot,
+            uint256 snapshotSupply,
+            uint256 withdrawn,
+            uint256 pauseTime
+        )
+    {
+        active = emergencyStorage.emergencyMode;
+        snapshot = emergencyStorage.emergencySnapshot;
+        snapshotSupply = emergencyStorage.emergencySnapshotSupply;
+        withdrawn = emergencyStorage.emergencyTotalWithdrawn;
+        pauseTime = emergencyStorage.pauseTimestamp;
     }
 
     function pause() external onlyRole(ADMIN_ROLE) {
@@ -410,6 +484,11 @@ contract SafeHedgeFundVault is
 
     function unpause() external onlyRole(ADMIN_ROLE) {
         _unpause();
+        // B-MED-3: clear the pause timestamp so a future
+        // checkEmergencyThreshold() call doesn't see stale data and trip
+        // the auto-emergency window on a subsequent pause that hasn't
+        // actually been in effect for 30 days.
+        delete emergencyStorage.pauseTimestamp;
     }
 
     function setAutoProcess(bool deposits, bool redemptions) external onlyRole(ADMIN_ROLE) {
@@ -443,27 +522,19 @@ contract SafeHedgeFundVault is
             queueIdx,
             navPerShare(),
             _normalize,
-            _denormalize,
-            _accrueEntranceFee
+            _previewEntranceFee,
+            _recordEntranceFee
         );
 
+        // processSingleDeposit now treats shares == 0 as a failure (B-HIGH-5),
+        // so on the ok=true branch we always have shares > 0 and the queue
+        // item's mint+deploy is safe to do here.
         if (ok) {
-            if (shares == 0) {
-                emit DepositAutoProcessFailed(
-                    queueStorage.depositQueue[queueIdx].user,
-                    queueStorage.depositQueue[queueIdx].amount,
-                    "zero shares calculated"
-                );
-                return;
-            }
-
             address user = queueStorage.depositQueue[queueIdx].user;
             uint256 amount = queueStorage.depositQueue[queueIdx].amount;
 
             _mint(user, shares);
-
             baseToken.safeTransfer(safeWallet, netNative);
-
             emit Deposited(user, amount, shares);
         } else {
             emit DepositAutoProcessFailed(
@@ -474,32 +545,37 @@ contract SafeHedgeFundVault is
         }
     }
 
-    function _processDepositMints(uint256 startIdx, uint256 count, uint256 nav) internal {
-        // Inlined from ProcessingHelper
-        for (uint256 i = 0; i < count; i++) {
-            uint256 idx = startIdx + i;
-            QueueManager.QueueItem storage item = queueStorage.depositQueue[idx];
-
-            if (item.processed && item.amount > 0) {
-                (uint256 netAmountNative, ) = feeStorage.accrueEntranceFee(item.amount);
-                uint256 netAmount = _normalize(netAmountNative);
-                uint256 shares = nav > 0 ? (netAmount * 1e18) / nav : netAmount;
-
-                if (shares == 0) continue;
-
-                _mint(item.user, shares);
-                baseToken.safeTransfer(safeWallet, netAmountNative);
-                emit Deposited(item.user, item.amount, shares);
-            }
-        }
+    /// @dev Callback invoked from QueueManager.processDepositBatch once a
+    /// queue item has cleared its slippage check and had its entrance fee
+    /// accrued. Single source of truth for share minting + Safe deployment.
+    function _mintAndDeploy(
+        address user,
+        uint256 originalAmount,
+        uint256 shares,
+        uint256 netAmountNative
+    ) internal {
+        _mint(user, shares);
+        baseToken.safeTransfer(safeWallet, netAmountNative);
+        emit Deposited(user, originalAmount, shares);
     }
 
+    /// @dev Pays a redemption out of the Safe via the module. Pure preview
+    /// up to the Safe call; only commits the exit fee to the ledger after
+    /// the user balance is verified to have grown by `netAmount`. This
+    /// matters because:
+    ///   - retried failed payouts must NOT keep adding to the fee ledger
+    ///     (B-CRIT-1)
+    ///   - the previous Safe→vault fee bounce-back transfer was both dead
+    ///     code (encoded a normalized amount as native, transfer always
+    ///     reverted) and would have double-counted on success (B-HIGH-4).
+    ///     Exit fee value already lives at the Safe — payoutAccruedFees
+    ///     pulls it back via the same module path when the admin calls.
     function _payout(address user, uint256 shares, uint256 nav)
         internal
         returns (bool success, uint256 netAmount)
     {
         uint256 gross = (shares * nav) / 1e18;
-        (uint256 net, uint256 feeNative) = feeStorage.accrueExitFee(gross);
+        (uint256 net, uint256 feeNormalized) = feeStorage.previewExitFee(gross);
         netAmount = _denormalize(net);
 
         uint256 userBalBefore = baseToken.balanceOf(user);
@@ -517,22 +593,13 @@ contract SafeHedgeFundVault is
             success = (userBalAfter >= userBalBefore + netAmount);
         }
 
-        if (success && feeNative > 0) {
-            bytes memory feeData = abi.encodeWithSelector(IERC20.transfer.selector, address(this), feeNative);
-            (bool feeOk, ) = safeWallet.call(
-                abi.encodeWithSignature(
-                    "execTransactionFromModule(address,uint256,bytes,uint8)",
-                    address(baseToken), 0, feeData, 0
-                )
-            );
-            if (feeOk) {
-                feeStorage.accruedExitFees += feeNative;
-            }
+        if (success && feeNormalized > 0) {
+            feeStorage.recordExitFee(feeNormalized);
         }
     }
 
     function _emergencyPayout(address user, uint256 amount) internal {
-        EmergencyManager.executePayout(baseToken, user, amount, safeWallet, isModuleEnabled);
+        EmergencyManager.executePayout(baseToken, user, amount);
     }
 
     function _transferBack(address user, uint256 amount) internal {
@@ -559,8 +626,12 @@ contract SafeHedgeFundVault is
         return maxBatchSize;
     }
 
-    function _accrueEntranceFee(uint256 amount) internal returns (uint256, uint256) {
-        return feeStorage.accrueEntranceFee(amount);
+    function _previewEntranceFee(uint256 amount) internal view returns (uint256, uint256) {
+        return feeStorage.previewEntranceFee(amount);
+    }
+
+    function _recordEntranceFee(uint256 feeNative) internal {
+        feeStorage.recordEntranceFee(feeNative);
     }
 
     function _emitDeposited(address user, uint256 amount, uint256 shares) internal {
@@ -580,13 +651,16 @@ contract SafeHedgeFundVault is
     }
 
     function navPerShare() public view aumNotStale returns (uint256) {
-        // Inlined from ViewHelper
-        uint256 netAum = feeStorage.aum > feeStorage.totalAccruedFees()
-            ? feeStorage.aum - feeStorage.totalAccruedFees()
-            : 0;
         if (totalSupply() == 0) {
             return DECIMAL_FACTOR * 1e18;
         }
+        // feeStorage.aum is in native decimals; totalAccruedFees() is in 18-dec
+        // normalized form. Bring AUM into normalized space before subtracting,
+        // otherwise we subtract mixed units and the resulting NAV is off by
+        // DECIMAL_FACTOR — breaks redemptions for any non-18-dec base token.
+        uint256 normalizedAum = feeStorage.aum * DECIMAL_FACTOR;
+        uint256 fees = feeStorage.totalAccruedFees();
+        uint256 netAum = normalizedAum > fees ? normalizedAum - fees : 0;
         return (netAum * 1e18) / totalSupply();
     }
 
@@ -692,6 +766,50 @@ contract SafeHedgeFundVault is
             abi.encodeWithSignature("isModuleEnabled(address)", address(this))
         );
         return success && abi.decode(data, (bool));
+    }
+
+    // ── Lending pool integration ───────────────────────────────────────
+
+    modifier onlyPool() {
+        if (msg.sender != sharedPool) revert OnlyPool();
+        _;
+    }
+
+    /// @notice Wire the vault to a deployed SharedPool. One-time admin setup.
+    function setSharedPool(address pool) external onlyRole(ADMIN_ROLE) {
+        require(pool != address(0), "zero pool");
+        sharedPool = pool;
+        emit SharedPoolSet(pool);
+    }
+
+    /// @notice Pool calls this to mint HFS to a user (e.g. on USDC→HFS swap).
+    function mintForPool(address to, uint256 amount) external onlyPool {
+        _mint(to, amount);
+    }
+
+    /// @notice Pool calls this to burn HFS from a user (e.g. on HFS→USDC swap
+    /// or to burn pool's own collateral on liquidation).
+    function burnFromUser(address from, uint256 amount) external onlyPool {
+        _burn(from, amount);
+    }
+
+    /// @notice Pool calls this when an event has increased the fund's USDC
+    /// holdings (a USDC→HFS swap brings USDC into the pool). The keeper's
+    /// next daily updateAum will replace this stored value with a fresh
+    /// total — but until then, fs.aum stays correct so NAV doesn't go stale.
+    /// Without this callback, a swap would mint HFS (supply ↑) without
+    /// AUM moving, and NAV would temporarily drop, opening an exploit
+    /// window for arbitrage between AMM swaps and the daily keeper update.
+    function addToAum(uint256 amount) external onlyPool {
+        feeStorage.aum += amount;
+    }
+
+    /// @notice Pool calls this when an event has decreased the fund's USDC
+    /// holdings (HFS→USDC swap pays USDC out, or liquidation writes off bad
+    /// debt of `amount`). Same rationale as addToAum: keeps NAV correct
+    /// between keeper updates.
+    function subFromAum(uint256 amount) external onlyPool {
+        feeStorage.aum = feeStorage.aum > amount ? feeStorage.aum - amount : 0;
     }
 
     function getFundConfig() external view returns (FundConfig memory config) {
